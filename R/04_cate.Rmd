@@ -1,0 +1,571 @@
+---
+title: "Efectos Heterogéneos (CATE) — Ser Pilo Paga"
+subtitle: "Movilidad Social y Educación de Élite | Métodos Analíticos · ITAM 2026-I"
+author: "Avril Salazar · Paulina Garza · Othoniel Reyes"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi        = 150
+)
+set.seed(999)
+```
+
+---
+
+## 0. Configuración
+
+```{r paquetes}
+library(tidyverse)
+library(hrbrthemes)
+library(patchwork)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(rdrobust)
+
+theme_set(
+  theme_ipsum_rc(base_size = 12, plot_title_size = 14, axis_title_size = 11)
+)
+
+COL_CTRL <- "#4A6FA5"
+COL_TRAT <- "#E07A5F"
+COL_UMBR <- "#2D2D2D"
+
+df <- read_csv("../data/spp_microset.csv", show_col_types = FALSE)
+
+# Estimación principal para recuperar h* (referencia para toda la sección)
+main_fit  <- rdrobust(y = df$Y, x = df$X1, fuzzy = df$D)
+h_main    <- main_fit$bws[1, 1]
+late_main <- main_fit$coef[3]
+se_main   <- main_fit$se[3]
+```
+
+---
+
+## 1. Estrategia para estimar CATE en Fuzzy RDD
+
+El LATE estimado en `03_fuzzy_rdd.Rmd` es un promedio sobre todos los *compliers* en la vecindad del umbral. El **CATE** (Conditional Average Treatment Effect) desagrega ese efecto por subgrupo para responder: ¿el programa beneficia por igual a mujeres y hombres, a minorías y no-minorías, a estudiantes de estrato bajo y alto?
+
+### Método: partición de muestra por subgrupo
+
+Corremos `rdrobust` de forma **separada** dentro de cada subgrupo. Cada estimación produce el LATE para los *compliers de ese subgrupo* — personas que se inscriben en universidad de élite si y solo si son elegibles y pertenecen a ese grupo.
+
+```{r helper-cate}
+# Función auxiliar: corre rdrobust dentro de un subconjunto de filas
+cate_run <- function(mask, label) {
+  df_sub <- df[mask & !is.na(mask), ]
+  fit <- tryCatch(
+    rdrobust(y = df_sub$Y, x = df_sub$X1, fuzzy = df_sub$D),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NULL)
+  h_val <- fit$bws[1, 1]
+  tibble(
+    Subgrupo   = label,
+    n          = nrow(df_sub),
+    LATE       = round(fit$coef[3], 4),
+    SE         = round(fit$se[3],   4),
+    `p-valor`  = round(fit$pv[3],   4),
+    `IC inf.`  = round(fit$ci[3,1], 4),
+    `IC sup.`  = round(fit$ci[3,2], 4),
+    h          = round(h_val, 2),
+    `N ef.`    = sum(abs(df_sub$X1) <= h_val, na.rm = TRUE)
+  )
+}
+
+# Test z para diferencia entre dos CATEs
+test_diff <- function(late1, se1, late2, se2, label) {
+  z_stat <- (late1 - late2) / sqrt(se1^2 + se2^2)
+  p_val  <- 2 * (1 - pnorm(abs(z_stat)))
+  tibble(
+    Contraste  = label,
+    Diferencia = round(late1 - late2, 4),
+    `z-stat`   = round(z_stat, 3),
+    `p-valor`  = round(p_val, 4),
+    Sig.       = case_when(p_val < 0.01 ~ "***",
+                           p_val < 0.05 ~ "**",
+                           p_val < 0.10 ~ "*",
+                           TRUE         ~ "n.s.")
+  )
+}
+```
+
+> **Advertencia de interpretación:** Comparar LATEs entre subgrupos no es lo mismo que estimar el ATE condicional. El LATE de cada grupo es el efecto para los *compliers dentro de ese grupo*, y los compliers pueden diferir sistemáticamente entre grupos (en §5 exploramos quiénes son los compliers en cada subgrupo).
+
+---
+
+## 2. Heterogeneidad por género
+
+¿La beca SPP beneficia más a mujeres o a hombres?
+
+```{r cate-genero}
+cate_genero <- bind_rows(
+  cate_run(df$icfes_female == 0, "Hombres"),
+  cate_run(df$icfes_female == 1, "Mujeres")
+)
+
+cate_genero %>%
+  kable(caption = "CATE por género") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r test-genero}
+test_diff(
+  cate_genero$LATE[cate_genero$Subgrupo == "Mujeres"],
+  cate_genero$SE[cate_genero$Subgrupo   == "Mujeres"],
+  cate_genero$LATE[cate_genero$Subgrupo == "Hombres"],
+  cate_genero$SE[cate_genero$Subgrupo   == "Hombres"],
+  label = "Mujeres − Hombres"
+) %>%
+  kable(caption = "Test z: diferencia de LATE entre géneros") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r plot-genero, fig.height=4}
+cate_genero %>%
+  ggplot(aes(x = LATE, y = Subgrupo, color = Subgrupo)) +
+  geom_vline(xintercept = 0,         color = COL_UMBR, linetype = "dashed",  linewidth = 0.7) +
+  geom_vline(xintercept = late_main, color = COL_UMBR, linetype = "dotted",  linewidth = 0.6, alpha = 0.6) +
+  geom_errorbarh(aes(xmin = `IC inf.`, xmax = `IC sup.`),
+                 height = 0.2, linewidth = 0.9) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("Hombres" = COL_CTRL, "Mujeres" = COL_TRAT)) +
+  annotate("text", x = late_main, y = Inf, vjust = 2, hjust = -0.1,
+           size = 3.5, color = COL_UMBR, fontface = "italic",
+           label = paste0("LATE global = ", round(late_main, 3))) +
+  labs(title = "CATE por género — IC 95%",
+       subtitle = "Línea punteada = LATE promedio de toda la muestra",
+       x = "LATE estimado (robusto)", y = NULL, color = NULL) +
+  theme(legend.position = "none")
+```
+
+---
+
+## 3. Heterogeneidad por minoría subrepresentada (URM)
+
+Las minorías étnicas enfrentan barreras adicionales de acceso a educación superior. ¿La beca SPP cierra esta brecha?
+
+```{r cate-urm}
+cate_urm <- bind_rows(
+  cate_run(df$icfes_urm == 0, "No minoría"),
+  cate_run(df$icfes_urm == 1, "Minoría (URM)")
+)
+
+cate_urm %>%
+  kable(caption = "CATE por estatus de minoría (URM)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r test-urm}
+test_diff(
+  cate_urm$LATE[cate_urm$Subgrupo == "Minoría (URM)"],
+  cate_urm$SE[cate_urm$Subgrupo   == "Minoría (URM)"],
+  cate_urm$LATE[cate_urm$Subgrupo == "No minoría"],
+  cate_urm$SE[cate_urm$Subgrupo   == "No minoría"],
+  label = "URM − No minoría"
+) %>%
+  kable(caption = "Test z: diferencia de LATE entre grupos étnicos") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r plot-urm, fig.height=4}
+cate_urm %>%
+  ggplot(aes(x = LATE, y = Subgrupo, color = Subgrupo)) +
+  geom_vline(xintercept = 0,         color = COL_UMBR, linetype = "dashed", linewidth = 0.7) +
+  geom_vline(xintercept = late_main, color = COL_UMBR, linetype = "dotted", linewidth = 0.6, alpha = 0.6) +
+  geom_errorbarh(aes(xmin = `IC inf.`, xmax = `IC sup.`),
+                 height = 0.2, linewidth = 0.9) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("No minoría" = COL_CTRL, "Minoría (URM)" = COL_TRAT)) +
+  labs(title = "CATE por estatus de minoría — IC 95%",
+       subtitle = "Línea punteada = LATE promedio de toda la muestra",
+       x = "LATE estimado (robusto)", y = NULL, color = NULL) +
+  theme(legend.position = "none")
+```
+
+---
+
+## 4. Heterogeneidad por estrato socioeconómico
+
+Agrupamos en tres categorías para tener suficientes observaciones en cada subgrupo. La mayoría de los estudiantes de SPP se concentra en estratos 1 y 2.
+
+```{r cate-estrato}
+df_str <- df %>% filter(!is.na(icfes_stratum))
+
+cate_estrato <- bind_rows(
+  cate_run(!is.na(df$icfes_stratum) & df$icfes_stratum == 1, "Estrato 1"),
+  cate_run(!is.na(df$icfes_stratum) & df$icfes_stratum == 2, "Estrato 2"),
+  cate_run(!is.na(df$icfes_stratum) & df$icfes_stratum >= 3, "Estrato 3+")
+)
+
+cate_estrato %>%
+  kable(caption = "CATE por estrato socioeconómico") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r test-estrato}
+bind_rows(
+  test_diff(
+    cate_estrato$LATE[cate_estrato$Subgrupo == "Estrato 1"],
+    cate_estrato$SE[cate_estrato$Subgrupo   == "Estrato 1"],
+    cate_estrato$LATE[cate_estrato$Subgrupo == "Estrato 2"],
+    cate_estrato$SE[cate_estrato$Subgrupo   == "Estrato 2"],
+    "Estrato 1 − Estrato 2"
+  ),
+  test_diff(
+    cate_estrato$LATE[cate_estrato$Subgrupo == "Estrato 1"],
+    cate_estrato$SE[cate_estrato$Subgrupo   == "Estrato 1"],
+    cate_estrato$LATE[cate_estrato$Subgrupo == "Estrato 3+"],
+    cate_estrato$SE[cate_estrato$Subgrupo   == "Estrato 3+"],
+    "Estrato 1 − Estrato 3+"
+  ),
+  test_diff(
+    cate_estrato$LATE[cate_estrato$Subgrupo == "Estrato 2"],
+    cate_estrato$SE[cate_estrato$Subgrupo   == "Estrato 2"],
+    cate_estrato$LATE[cate_estrato$Subgrupo == "Estrato 3+"],
+    cate_estrato$SE[cate_estrato$Subgrupo   == "Estrato 3+"],
+    "Estrato 2 − Estrato 3+"
+  )
+) %>%
+  kable(caption = "Tests z: diferencias de LATE entre estratos") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r plot-estrato, fig.height=4.5}
+cate_estrato %>%
+  mutate(Subgrupo = fct_rev(fct_inorder(Subgrupo))) %>%
+  ggplot(aes(x = LATE, y = Subgrupo)) +
+  geom_vline(xintercept = 0,         color = COL_UMBR, linetype = "dashed", linewidth = 0.7) +
+  geom_vline(xintercept = late_main, color = COL_UMBR, linetype = "dotted", linewidth = 0.6, alpha = 0.6) +
+  geom_errorbarh(aes(xmin = `IC inf.`, xmax = `IC sup.`),
+                 height = 0.2, linewidth = 0.9, color = COL_CTRL) +
+  geom_point(size = 4, color = COL_CTRL) +
+  labs(title = "CATE por estrato socioeconómico — IC 95%",
+       subtitle = "Línea punteada = LATE promedio de toda la muestra",
+       x = "LATE estimado (robusto)", y = NULL) +
+  theme(legend.position = "none")
+```
+
+---
+
+## 5. Interseccionalidad: género × URM
+
+Exploramos si la heterogeneidad de género y étnica se amplifica o se modera cuando se cruzan ambas dimensiones.
+
+```{r cate-intersec}
+cate_int <- bind_rows(
+  cate_run(df$icfes_female == 0 & df$icfes_urm == 0, "Hombre, No URM"),
+  cate_run(df$icfes_female == 0 & df$icfes_urm == 1, "Hombre, URM"),
+  cate_run(df$icfes_female == 1 & df$icfes_urm == 0, "Mujer, No URM"),
+  cate_run(df$icfes_female == 1 & df$icfes_urm == 1, "Mujer, URM")
+)
+
+# Verificar precisión: SE > 0.10 indica submuestra demasiado pequeña para conclusiones firmes
+cate_int_display <- cate_int %>%
+  mutate(
+    Advertencia = ifelse(SE > 0.10,
+                         "⚠️ SE alto — muestra pequeña, resultado indicativo",
+                         "✓")
+  )
+
+cate_int_display %>%
+  kable(caption = "CATE por intersección género × URM (SE > 0.10 → resultado impreciso)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  column_spec(ncol(cate_int_display),
+              bold = TRUE,
+              color = ifelse(cate_int_display$SE > 0.10, COL_TRAT, COL_CTRL))
+```
+
+> **Nota de precisión:** La celda **Mujer, URM** tiene SE = `r round(cate_int$SE[cate_int$Subgrupo == "Mujer, URM"], 3)` — más del doble que cualquier otra celda. Esto refleja que la submuestra de mujeres pertenecientes a minorías étnicas dentro del ancho de banda es pequeña: el estimador es ruidoso y el IC 95% es muy amplio. El LATE de esta celda debe interpretarse como **indicativo, no conclusivo**. Para el reporte final, se recomienda reportar el CATE por género y por URM por separado (§2 y §3), que son precisos, y mencionar la intersección solo en nota al pie.
+
+```{r plot-intersec, fig.height=5}
+cate_int %>%
+  mutate(
+    Género = ifelse(grepl("Mujer", Subgrupo), "Mujer", "Hombre"),
+    URM    = ifelse(grepl("URM", Subgrupo), "Minoría (URM)", "No minoría"),
+    Subgrupo = fct_rev(fct_inorder(Subgrupo))
+  ) %>%
+  ggplot(aes(x = LATE, y = Subgrupo, color = Género, shape = URM)) +
+  geom_vline(xintercept = 0,         color = COL_UMBR, linetype = "dashed", linewidth = 0.7) +
+  geom_vline(xintercept = late_main, color = COL_UMBR, linetype = "dotted", linewidth = 0.6, alpha = 0.6) +
+  geom_errorbarh(aes(xmin = `IC inf.`, xmax = `IC sup.`),
+                 height = 0.2, linewidth = 0.8) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("Hombre" = COL_CTRL, "Mujer" = COL_TRAT)) +
+  scale_shape_manual(values = c("No minoría" = 16, "Minoría (URM)" = 17)) +
+  labs(title = "CATE por intersección género × URM — IC 95%",
+       subtitle = "Triángulo = minoría URM | Círculo = no minoría",
+       x = "LATE estimado (robusto)", y = NULL,
+       color = NULL, shape = NULL) +
+  theme(legend.position = "top")
+```
+
+---
+
+## 6. Forest plot general de heterogeneidad
+
+Consolidamos todos los CATEs estimados en un solo gráfico comparativo.
+
+```{r forest-cate, fig.height=8}
+all_cates <- bind_rows(
+  cate_genero  %>% mutate(Dimensión = "Género"),
+  cate_urm     %>% mutate(Dimensión = "Etnia"),
+  cate_estrato %>% mutate(Dimensión = "Estrato"),
+  cate_int     %>% mutate(Dimensión = "Género × URM")
+) %>%
+  mutate(
+    Subgrupo  = fct_rev(fct_inorder(Subgrupo)),
+    sig       = `p-valor` < 0.05,
+    impreciso = SE > 0.10   # SE alto → submuestra pequeña → resultados indicativos
+  )
+
+# Línea del LATE global con IC para referencia
+late_ci_l <- main_fit$ci[3, 1]
+late_ci_u <- main_fit$ci[3, 2]
+
+ggplot(all_cates, aes(x = LATE, y = Subgrupo, color = Dimensión)) +
+  # LATE global como banda de referencia
+  annotate("rect", xmin = late_ci_l, xmax = late_ci_u,
+           ymin = -Inf, ymax = Inf, alpha = 0.06, fill = COL_UMBR) +
+  geom_vline(xintercept = 0,         color = COL_UMBR, linetype = "dashed", linewidth = 0.7) +
+  geom_vline(xintercept = late_main, color = COL_UMBR, linetype = "solid",  linewidth = 0.5, alpha = 0.5) +
+  geom_errorbarh(aes(xmin = `IC inf.`, xmax = `IC sup.`, alpha = impreciso),
+                 height = 0.3, linewidth = 0.8) +
+  geom_point(aes(size = sig, alpha = impreciso, shape = impreciso)) +
+  scale_color_manual(values = c(
+    "Género"       = "#4A6FA5",
+    "Etnia"        = "#E07A5F",
+    "Estrato"      = "#6A994E",
+    "Género × URM" = "#9B5DE5"
+  )) +
+  scale_size_manual(values = c("TRUE" = 4, "FALSE" = 2.5),
+                    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"),
+                    name = "Significancia") +
+  scale_alpha_manual(values = c("TRUE" = 0.45, "FALSE" = 1),
+                     labels = c("TRUE" = "SE > 0.10 (impreciso)", "FALSE" = "Preciso"),
+                     name = "Precisión") +
+  scale_shape_manual(values = c("TRUE" = 1, "FALSE" = 16),
+                     labels = c("TRUE" = "SE > 0.10 (impreciso)", "FALSE" = "Preciso"),
+                     name = "Precisión") +
+  facet_grid(Dimensión ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title    = "Forest plot: CATEs por dimensión de heterogeneidad",
+    subtitle = paste0("Banda gris = IC 95% del LATE global (", round(late_main, 3),
+                      ")  |  Círculo vacío = SE alto, resultado indicativo"),
+    x        = "LATE estimado (robusto, IC 95%)",
+    y        = NULL,
+    color    = NULL
+  ) +
+  theme(
+    legend.position = "top",
+    strip.text.y    = element_text(angle = 0, hjust = 0)
+  )
+```
+
+---
+
+## 7. Tabla resumen de todos los CATEs
+
+```{r tabla-resumen-cate}
+all_cates %>%
+  select(Dimensión, Subgrupo, n, LATE, SE, `p-valor`, `IC inf.`, `IC sup.`, h) %>%
+  arrange(Dimensión, Subgrupo) %>%
+  kable(caption = "Resumen de CATEs por subgrupo — todas las dimensiones") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                font_size = 12) %>%
+  pack_rows("Género",       1, 2) %>%
+  pack_rows("Etnia (URM)",  3, 4) %>%
+  pack_rows("Estrato",      5, 7) %>%
+  pack_rows("Género × URM", 8, 11)
+```
+
+---
+
+## 8. Caracterización de los compliers por subgrupo
+
+¿Quiénes son los *compliers* en cada subgrupo? La proporción de compliers en un subgrupo X es proporcional a la **primera etapa local** dentro de ese subgrupo. Si el subgrupo X tiene una primera etapa más alta que el promedio, está sobre-representado entre los compliers.
+
+```{r complier-char}
+# Primera etapa global (dentro del ancho de banda h*)
+df_bw  <- df %>% filter(abs(X1) <= h_main)
+pi_global <- mean(df_bw$D[df_bw$T == 1], na.rm = TRUE) -
+             mean(df_bw$D[df_bw$T == 0], na.rm = TRUE)
+
+# Primera etapa por subgrupo dentro del ancho de banda
+primera_etapa_sub <- function(mask_str, label) {
+  mask   <- eval(parse(text = mask_str), envir = df_bw)
+  sub_bw <- df_bw[!is.na(mask) & mask, ]
+  pi_sub <- mean(sub_bw$D[sub_bw$T == 1], na.rm = TRUE) -
+            mean(sub_bw$D[sub_bw$T == 0], na.rm = TRUE)
+  p_sub  <- mean(!is.na(mask) & mask)   # fracción de la muestra BW
+  tibble(
+    Subgrupo          = label,
+    `% en muestra BW` = round(p_sub * 100, 1),
+    `π subgrupo`      = round(pi_sub, 4),
+    `π global`        = round(pi_global, 4),
+    `Índice relativo` = round(pi_sub / pi_global, 3)
+  )
+}
+
+complier_tbl <- bind_rows(
+  primera_etapa_sub("icfes_female == 1", "Mujeres"),
+  primera_etapa_sub("icfes_female == 0", "Hombres"),
+  primera_etapa_sub("icfes_urm == 1",    "Minoría URM"),
+  primera_etapa_sub("icfes_urm == 0",    "No minoría"),
+  primera_etapa_sub("!is.na(icfes_stratum) & icfes_stratum == 1", "Estrato 1"),
+  primera_etapa_sub("!is.na(icfes_stratum) & icfes_stratum == 2", "Estrato 2"),
+  primera_etapa_sub("!is.na(icfes_stratum) & icfes_stratum >= 3", "Estrato 3+")
+)
+
+complier_tbl %>%
+  kable(caption = paste0(
+    "Caracterización de compliers por subgrupo (dentro de h* = ",
+    round(h_main, 2), ")"
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(5, bold = TRUE,
+              color = ifelse(complier_tbl$`Índice relativo` > 1,
+                             COL_TRAT, COL_CTRL))
+```
+
+```{r complier-plot, fig.height=4.5}
+complier_tbl %>%
+  mutate(
+    Subgrupo = fct_rev(fct_inorder(Subgrupo)),
+    color    = ifelse(`Índice relativo` > 1, "Sobre-representado", "Sub-representado")
+  ) %>%
+  ggplot(aes(x = `Índice relativo`, y = Subgrupo, fill = color)) +
+  geom_col(width = 0.6, alpha = 0.85) +
+  geom_vline(xintercept = 1, color = COL_UMBR, linewidth = 0.8, linetype = "dashed") +
+  scale_fill_manual(values = c("Sobre-representado" = COL_TRAT,
+                                "Sub-representado"  = COL_CTRL)) +
+  labs(
+    title    = "Representación de cada subgrupo entre los compliers",
+    subtitle = "Índice = π(subgrupo) / π(global)  |  > 1 → sobre-representado entre compliers",
+    x        = "Índice relativo de compliers",
+    y        = NULL,
+    fill     = NULL
+  ) +
+  theme(legend.position = "top")
+```
+
+> **Lectura:** Un índice > 1 indica que ese subgrupo responde más al umbral (proporcionalmente más compliers). Esto no implica un efecto mayor — eso lo miden los CATEs. El índice mide la *densidad* de compliers, que determina qué población está siendo identificada en cada CATE.
+
+---
+
+## 9. Implicaciones para validez externa
+
+```{r ext-validity, fig.height=5}
+# Comparamos el LATE global con los CATEs para evaluar sesgos de agregación
+cate_summary <- all_cates %>%
+  filter(Dimensión != "Género × URM") %>%
+  select(Dimensión, Subgrupo, LATE, `IC inf.`, `IC sup.`, n) %>%
+  bind_rows(
+    tibble(Dimensión = "Muestra completa",
+           Subgrupo  = "LATE global",
+           LATE      = late_main,
+           `IC inf.` = main_fit$ci[3,1],
+           `IC sup.` = main_fit$ci[3,2],
+           n         = nrow(df))
+  ) %>%
+  mutate(Subgrupo = fct_rev(fct_inorder(Subgrupo)))
+
+ggplot(cate_summary, aes(x = LATE, y = Subgrupo,
+                         color = Dimensión, size = Dimensión == "Muestra completa")) +
+  geom_vline(xintercept = 0, color = COL_UMBR, linetype = "dashed", linewidth = 0.7) +
+  geom_errorbarh(aes(xmin = `IC inf.`, xmax = `IC sup.`),
+                 height = 0.25, linewidth = 0.8) +
+  geom_point() +
+  scale_color_manual(values = c(
+    "Muestra completa" = COL_UMBR,
+    "Género"     = "#4A6FA5",
+    "Etnia"      = "#E07A5F",
+    "Estrato"    = "#6A994E"
+  )) +
+  scale_size_manual(values = c("TRUE" = 5, "FALSE" = 3), guide = "none") +
+  facet_grid(Dimensión ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title    = "CATEs vs. LATE global",
+    subtitle = "Los CATEs permiten evaluar si el efecto promedio oculta heterogeneidad relevante",
+    x        = "LATE / CATE estimado (robusto, IC 95%)",
+    y        = NULL, color    = NULL
+  ) +
+  theme(
+    legend.position = "none",
+    strip.text.y    = element_text(angle = 0, hjust = 0)
+  )
+```
+
+---
+
+## Resumen de hallazgos de heterogeneidad
+
+```{r resumen-cate}
+# Armamos el resumen con datos calculados
+genero_diff <- test_diff(
+  cate_genero$LATE[cate_genero$Subgrupo == "Mujeres"],
+  cate_genero$SE[cate_genero$Subgrupo   == "Mujeres"],
+  cate_genero$LATE[cate_genero$Subgrupo == "Hombres"],
+  cate_genero$SE[cate_genero$Subgrupo   == "Hombres"],
+  "Mujeres vs. Hombres"
+)
+urm_diff <- test_diff(
+  cate_urm$LATE[cate_urm$Subgrupo == "Minoría (URM)"],
+  cate_urm$SE[cate_urm$Subgrupo   == "Minoría (URM)"],
+  cate_urm$LATE[cate_urm$Subgrupo == "No minoría"],
+  cate_urm$SE[cate_urm$Subgrupo   == "No minoría"],
+  "URM vs. No URM"
+)
+
+tibble(
+  Dimensión = c("LATE global", "Género", "Etnia (URM)", "Estrato"),
+  `Valores (LATE robusto)` = c(
+    paste0(round(late_main, 3),
+           "  SE = ", round(se_main, 3)),
+    paste0("Mujeres = ", cate_genero$LATE[cate_genero$Subgrupo == "Mujeres"],
+           "  |  Hombres = ", cate_genero$LATE[cate_genero$Subgrupo == "Hombres"]),
+    paste0("URM = ",  cate_urm$LATE[cate_urm$Subgrupo == "Minoría (URM)"],
+           "  |  No URM = ", cate_urm$LATE[cate_urm$Subgrupo == "No minoría"]),
+    paste0("E1 = ", cate_estrato$LATE[cate_estrato$Subgrupo == "Estrato 1"],
+           "  |  E2 = ", cate_estrato$LATE[cate_estrato$Subgrupo == "Estrato 2"],
+           "  |  E3+ = ", cate_estrato$LATE[cate_estrato$Subgrupo == "Estrato 3+"])
+  ),
+  `Test diferencia` = c(
+    "—",
+    paste0("z = ", genero_diff$`z-stat`, "  p = ", genero_diff$`p-valor`,
+           "  ", genero_diff$Sig.),
+    paste0("z = ", urm_diff$`z-stat`,    "  p = ", urm_diff$`p-valor`,
+           "  ", urm_diff$Sig.),
+    "Ver tabla §4"
+  )
+) %>%
+  kable(caption = "Resumen de heterogeneidad del efecto SPP") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE) %>%
+  column_spec(1, bold = TRUE, width = "15%") %>%
+  column_spec(2, width = "50%") %>%
+  column_spec(3, width = "35%")
+```
+
+**Siguientes pasos — `05_sensibilidad.Rmd`:**
+
+1. **E-values** (Ding & VanderWeele): ¿qué tan fuerte tendría que ser un confusor no observado para anular el LATE?
+2. **Estratificación principal**: análisis del sesgo de selección post-tratamiento en Y (el resultado solo se observa para quienes completan)
+3. Discusión integrada para el reporte final
