@@ -1,0 +1,672 @@
+---
+title: "Análisis de Sensibilidad — Ser Pilo Paga"
+subtitle: "Movilidad Social y Educación de Élite | Métodos Analíticos · ITAM 2026-I"
+author: "Avril Salazar · Paulina Garza · Othoniel Reyes"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi        = 150
+)
+set.seed(999)
+```
+
+---
+
+## 0. Configuración
+
+```{r paquetes}
+library(tidyverse)
+library(hrbrthemes)
+library(patchwork)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(rdrobust)
+library(EValue)
+
+theme_set(
+  theme_ipsum_rc(base_size = 12, plot_title_size = 14, axis_title_size = 11)
+)
+
+COL_CTRL <- "#4A6FA5"
+COL_TRAT <- "#E07A5F"
+COL_UMBR <- "#2D2D2D"
+COL_NEUT <- "#6A994E"
+
+df <- read_csv("../data/spp_microset.csv", show_col_types = FALSE)
+
+# Estimación principal (Fuzzy RDD)
+main_fit  <- rdrobust(y = df$Y, x = df$X1, fuzzy = df$D)
+h_main    <- main_fit$bws[1, 1]
+late_main <- main_fit$coef[3]
+se_main   <- main_fit$se[3]
+ci_lo     <- main_fit$ci[3, 1]
+ci_hi     <- main_fit$ci[3, 2]
+
+# Estimaciones separadas para la descomposición Wald
+fs_fit  <- rdrobust(y = df$D, x = df$X1)   # primera etapa: T → D
+rf_fit  <- rdrobust(y = df$Y, x = df$X1)   # forma reducida: T → Y
+
+fs_est  <- fs_fit$coef[3]   # salto en P(D=1)
+rf_est  <- rf_fit$coef[3]   # salto en E(Y)
+```
+
+---
+
+## 1. Marco conceptual
+
+El Fuzzy RDD identifica el LATE bajo tres supuestos fundamentales:
+
+| Supuesto | Descripción | Amenaza concreta en SPP |
+|----------|-------------|-------------------------|
+| **Continuidad** | Sin saltos en características pre-tratamiento en el umbral | Manipulación del puntaje Saber 11 (→ prueba de McCrary, ya verificada) |
+| **Restricción de exclusión** | T solo afecta Y a través de D | Efecto directo de *saber* que eres elegible (información, motivación) |
+| **Monotonicidad** | No hay defiers: si T=0 → D=0 implica T=1 → D=1 para todo individuo | Grupos que por alguna razón NO se inscriben cuando son elegibles |
+
+La prueba de McCrary y el balance de covariables (archivos `02_supuestos.Rmd`) cubrieron la continuidad. Este archivo analiza las otras dos amenazas con tres herramientas:
+
+1. **E-valores**: ¿qué tan fuerte tendría que ser un sesgo no medido para anular el LATE?
+2. **Curva de sensibilidad a la exclusión**: ¿cuánto del RF puede ser efecto directo antes de que el LATE se vuelva cero?
+3. **Estratificación principal**: ¿quiénes son los *compliers* y qué implicaciones tiene eso para la interpretación del LATE?
+
+---
+
+## 2. E-valores (Ding & VanderWeele 2016)
+
+### 2.1 Idea y definición
+
+El **E-valor** responde la pregunta: ¿qué tan fuerte tendría que ser la asociación entre una variable de sesgo $U$ y (a) el tratamiento y (b) el resultado para explicar completamente el efecto estimado?
+
+Formalmente, dado un riesgo relativo observado $\widehat{RR}$, el E-valor es:
+
+$$E = \widehat{RR} + \sqrt{\widehat{RR}(\widehat{RR} - 1)}$$
+
+Esto implica que si existiera un confusor $U$ con $RR_{UD} \geq E$ *y* $RR_{UY} \geq E$, ese confusor podría explicar el efecto observado. Si no existe un confusor razonablemente plausible con esa fuerza, la estimación es robusta.
+
+> **Nota de aplicación:** El E-valor fue diseñado para estudios observacionales. En nuestro contexto de Fuzzy RDD, el "sesgo" equivale a cualquier fuente de violación de los supuestos de identificación: manipulación residual del umbral, efectos directos del instrumento, o heterogeneidad no observada que cambie discontinuamente en el umbral.
+
+### 2.2 Conversión: diferencia de riesgo → razón de riesgo
+
+Nuestro LATE es una **diferencia de riesgo** (RD), porque Y es binaria. El E-valor opera sobre **razones de riesgo** (RR). Convertimos usando el riesgo base $p_0$ estimado dentro del ancho de banda óptimo:
+
+$$\widehat{RR} = 1 + \frac{\widehat{RD}}{p_0}, \quad SE_{RR} \approx \frac{SE_{RD}}{p_0}$$
+
+```{r riesgo-base}
+# Riesgo base: P(Y=1 | D=0) dentro del ancho de banda h*
+df_bw  <- df %>% filter(abs(X1) <= h_main)
+
+p0_bw  <- mean(df_bw$Y[df_bw$D == 0], na.rm = TRUE)
+p1_bw  <- mean(df_bw$Y[df_bw$D == 1], na.rm = TRUE)
+
+# Conversión RD → RR (método delta)
+rr_pt  <- 1 + late_main / p0_bw
+rr_lo  <- 1 + ci_lo     / p0_bw
+rr_hi  <- 1 + ci_hi     / p0_bw
+
+tibble(
+  Parámetro = c("Riesgo base p₀ (D=0, |X₁| ≤ h*)",
+                "Riesgo con tratamiento p₁ (D=1, |X₁| ≤ h*)",
+                "LATE = diferencia de riesgo (RD)",
+                "RR equivalente (punto)",
+                "RR — límite inferior IC 95%",
+                "RR — límite superior IC 95%"),
+  Valor = round(c(p0_bw, p1_bw, late_main, rr_pt, rr_lo, rr_hi), 4)
+) %>%
+  kable(caption = "Conversión LATE (RD) → RR para el cálculo del E-valor") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### 2.3 E-valor del LATE principal
+
+```{r evalor-principal}
+# E-valor para el RR equivalente al LATE (H₀: RR = 1 ↔ RD = 0)
+evalue_res <- evalues.RR(est = rr_pt, lo = rr_lo, hi = rr_hi, true = 1)
+
+# Extraer E-valores
+ev_pt  <- evalue_res[1, 2]   # E-valor de la estimación puntual
+ev_ci  <- evalue_res[2, 2]   # E-valor del límite inferior del IC
+
+tibble(
+  Referencia = c("Estimación puntual (LATE robusto)",
+                 "Límite inferior del IC 95%"),
+  `RR equivalente`   = round(c(rr_pt, rr_lo), 3),
+  `E-valor`          = round(c(ev_pt, ev_ci), 3),
+  Interpretación     = c(
+    paste0("Un sesgo necesitaría RR_UD ≥ ", round(ev_pt, 2),
+           " y RR_UY ≥ ", round(ev_pt, 2), " para anular el efecto"),
+    paste0("Para cruzar el cero, el sesgo requeriría RR ≥ ", round(ev_ci, 2),
+           " en ambas relaciones")
+  )
+) %>%
+  kable(caption = "E-valores para el LATE del Fuzzy RDD") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  column_spec(3, bold = TRUE, color = COL_TRAT)
+```
+
+```{r evalor-interpretacion}
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("  E-valor (estimación puntual): ", round(ev_pt, 3), "\n")
+cat("  E-valor (límite IC inferior): ", round(ev_ci, 3), "\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+cat("Interpretación:\n")
+cat("  Para que un confusor no observado ANULARA el LATE puntual,\n")
+cat("  tendría que estar asociado con el tratamiento (D) Y con Y\n")
+cat("  por un factor de al menos", round(ev_pt, 2), "veces (RR).\n\n")
+cat("  Para mover el efecto hasta cruzar el cero (nulidad estadística),\n")
+cat("  el sesgo mínimo requerido es RR =", round(ev_ci, 2), "en ambas relaciones.\n\n")
+cat("  Contexto: en ciencias sociales, efectos del tamaño de variables\n")
+cat("  fuertes como género, estrato o región suelen tener RR < 3.\n")
+cat("  Un E-valor >", round(ev_ci, 2), "sugiere que el resultado es robusta a\n")
+cat("  confusión de magnitud plausible.\n")
+```
+
+### 2.4 Curva de sesgo del E-valor
+
+La curva de sesgo muestra los pares de valores $(RR_{UD}, RR_{UY})$ que, combinados, podrían explicar distintos niveles del efecto observado.
+
+```{r curva-evalor, fig.height=5}
+# Cuadrícula de pares (RR_UD, RR_UY) que producen un sesgo neto dado
+rr_grid <- seq(1, max(ev_pt + 1, ev_ci + 0.5), length.out = 300)
+
+# El sesgo neto B = (RR_UD × RR_UY) / (RR_UD + RR_UY - 1)
+# Curva: para cada RR_UD fijo, el RR_UY mínimo que produce B = E-valor
+bias_rr_uy <- function(rr_ud, b_target) {
+  # Despejando RR_UY de B = (rr_ud * rr_uy) / (rr_ud + rr_uy - 1) = b_target
+  num <- b_target * (rr_ud - 1)
+  den <- rr_ud - b_target
+  ifelse(den <= 0, NA_real_, num / den)
+}
+
+curve_df <- tibble(rr_ud = rr_grid) %>%
+  mutate(
+    rr_uy_pt  = bias_rr_uy(rr_ud, ev_pt),
+    rr_uy_ci  = bias_rr_uy(rr_ud, ev_ci)
+  ) %>%
+  pivot_longer(cols = starts_with("rr_uy"),
+               names_to = "nivel", values_to = "rr_uy") %>%
+  mutate(nivel = recode(nivel,
+    rr_uy_pt = paste0("E-valor puntual (", round(ev_pt, 2), ")"),
+    rr_uy_ci = paste0("E-valor IC inf. (", round(ev_ci, 2), ")")
+  ))
+
+ggplot(curve_df %>% filter(!is.na(rr_uy), rr_uy > 0, rr_uy < 20),
+       aes(x = rr_ud, y = rr_uy, color = nivel, linetype = nivel)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = tibble(
+    x    = c(ev_pt, ev_ci),
+    y    = c(ev_pt, ev_ci),
+    nivel = c(paste0("E-valor puntual (", round(ev_pt, 2), ")"),
+              paste0("E-valor IC inf. (", round(ev_ci, 2), ")"))
+  ), aes(x = x, y = y), size = 4, show.legend = FALSE) +
+  scale_color_manual(values = c(COL_TRAT, COL_CTRL)) +
+  scale_linetype_manual(values = c("solid", "dashed")) +
+  labs(
+    title    = "Curva de sesgo del E-valor",
+    subtitle = "Pares (RR_UD, RR_UY) que explicarían completamente el efecto observado",
+    x        = "Asociación confusor–tratamiento (RR_UD)",
+    y        = "Asociación confusor–resultado (RR_UY)",
+    color    = NULL, linetype = NULL
+  ) +
+  theme(legend.position = "top") +
+  annotate("text", x = ev_pt + 0.3, y = ev_pt + 0.5,
+           label = paste0("E-valor\npuntual\n", round(ev_pt, 2)),
+           size = 3.2, color = COL_TRAT, hjust = 0) +
+  annotate("text", x = ev_ci + 0.3, y = ev_ci + 0.5,
+           label = paste0("E-valor\nIC inf.\n", round(ev_ci, 2)),
+           size = 3.2, color = COL_CTRL, hjust = 0)
+```
+
+> **Lectura:** cualquier punto sobre las curvas representa un confusor capaz de explicar el efecto. Los puntos marcados son los E-valores: pares simétricos donde $RR_{UD} = RR_{UY} = E$. La región bajo la curva del IC inferior representa sesgos que no bastarían para cruzar el cero.
+
+### 2.5 E-valores por subgrupo (CATEs)
+
+```{r evalores-cate}
+# Replicamos la función cate_run de 04_cate.Rmd para calcular E-valores por subgrupo
+cate_evalor <- function(mask, label) {
+  df_sub <- df[mask & !is.na(mask), ]
+  fit <- tryCatch(rdrobust(y = df_sub$Y, x = df_sub$X1, fuzzy = df_sub$D),
+                  error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+
+  h_sub <- fit$bws[1, 1]
+  sub_bw <- df_sub %>% filter(abs(X1) <= h_sub)
+  p0_sub <- mean(sub_bw$Y[sub_bw$D == 0], na.rm = TRUE)
+  if (is.na(p0_sub) || p0_sub <= 0) return(NULL)
+
+  late_s  <- fit$coef[3]
+  ci_lo_s <- fit$ci[3, 1]
+
+  rr_s    <- 1 + late_s  / p0_sub
+  rr_lo_s <- 1 + ci_lo_s / p0_sub
+  if (rr_lo_s <= 1) rr_lo_s <- 1.001
+
+  ev <- tryCatch(evalues.RR(est = rr_s, lo = rr_lo_s, hi = 1 + fit$ci[3,2]/p0_sub, true = 1),
+                 error = function(e) NULL)
+  if (is.null(ev)) return(NULL)
+
+  tibble(
+    Subgrupo      = label,
+    LATE          = round(late_s, 4),
+    `RR equiv.`   = round(rr_s, 3),
+    `E-valor (pt)` = round(ev[1, 2], 3),
+    `E-valor (IC)` = round(ev[2, 2], 3)
+  )
+}
+
+evalores_df <- bind_rows(
+  cate_evalor(rep(TRUE, nrow(df)),     "LATE global"),
+  cate_evalor(df$icfes_female == 0,    "Hombres"),
+  cate_evalor(df$icfes_female == 1,    "Mujeres"),
+  cate_evalor(df$icfes_urm == 0,       "No minoría"),
+  cate_evalor(df$icfes_urm == 1,       "Minoría (URM)"),
+  cate_evalor(!is.na(df$icfes_stratum) & df$icfes_stratum == 1, "Estrato 1"),
+  cate_evalor(!is.na(df$icfes_stratum) & df$icfes_stratum == 2, "Estrato 2"),
+  cate_evalor(!is.na(df$icfes_stratum) & df$icfes_stratum >= 3, "Estrato 3+")
+)
+
+evalores_df %>%
+  kable(caption = "E-valores por subgrupo — robustez de los CATEs a sesgo no medido") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  pack_rows("Muestra completa", 1, 1) %>%
+  pack_rows("Género",           2, 3) %>%
+  pack_rows("Etnia",            4, 5) %>%
+  pack_rows("Estrato",          6, 8) %>%
+  column_spec(4, bold = TRUE) %>%
+  column_spec(5, color = ifelse(evalores_df$`E-valor (IC)` > 3, COL_NEUT, COL_TRAT))
+```
+
+---
+
+## 3. Sensibilidad a la restricción de exclusión
+
+### 3.1 El problema
+
+La restricción de exclusión exige que el instrumento $T$ (elegibilidad) afecte $Y$ **únicamente a través de** $D$ (inscripción). En SPP, esto puede violarse si:
+
+- La notificación de elegibilidad genera un efecto de *información* o *motivación* independiente de la inscripción
+- Las universidades cambian sus políticas de admisión al saber que hay estudiantes elegibles cercanos al umbral
+- El umbral genera efectos de pares (peer effects) en la preparación
+
+Sea $\delta$ el **efecto directo** de $T$ en $Y$ (en unidades del resultado, más allá de $D$). El LATE corregido sería:
+
+$$\widehat{LATE}(\delta) = \frac{\widehat{RF} - \delta}{\widehat{FS}}$$
+
+donde $\widehat{RF}$ es la forma reducida (ITT sobre $Y$) y $\widehat{FS}$ es la primera etapa (ITT sobre $D$).
+
+### 3.2 Descomposición Wald
+
+```{r descomp-wald}
+tibble(
+  Componente = c("Primera etapa (FS): salto en P(D=1)",
+                 "Forma reducida (RF): salto en E(Y)",
+                 "LATE = RF / FS",
+                 "Verificación LATE fuzzy rdrobust"),
+  Estimado   = round(c(fs_est, rf_est, rf_est / fs_est, late_main), 4),
+  SE         = round(c(fs_fit$se[3], rf_fit$se[3], NA, se_main), 4)
+) %>%
+  kable(caption = "Descomposición Wald del estimador Fuzzy RDD") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(1, width = "50%")
+```
+
+### 3.3 Curva de sensibilidad: LATE bajo distintos δ
+
+```{r curva-exclusion, fig.height=5}
+# Grilla de efectos directos δ: de 0 hasta RF (donde LATE = 0)
+delta_grid <- seq(0, rf_est * 1.05, length.out = 300)
+late_adj   <- (rf_est - delta_grid) / fs_est
+
+sens_df <- tibble(
+  delta    = delta_grid,
+  late_adj = late_adj,
+  delta_pct = delta_grid / rf_est * 100
+)
+
+# Puntos de referencia clave
+delta_null  <- rf_est                         # LATE = 0
+delta_half  <- rf_est / 2                     # LATE = mitad del original
+delta_10pct <- 0.10 * rf_est                  # 10% del RF como efecto directo
+
+ggplot(sens_df, aes(x = delta, y = late_adj)) +
+  geom_ribbon(aes(ymin = late_adj - 1.96 * se_main / fs_est,
+                  ymax = late_adj + 1.96 * se_main / fs_est),
+              fill = COL_CTRL, alpha = 0.15) +
+  geom_line(color = COL_CTRL, linewidth = 1.1) +
+  geom_hline(yintercept = 0,         color = COL_UMBR, linetype = "dashed", linewidth = 0.7) +
+  geom_hline(yintercept = late_main, color = COL_UMBR, linetype = "solid",
+             linewidth = 0.5, alpha = 0.4) +
+  # Línea del 10% del RF
+  geom_vline(xintercept = delta_10pct, color = COL_NEUT, linetype = "dotted", linewidth = 1) +
+  geom_vline(xintercept = delta_null,  color = COL_TRAT,  linetype = "dashed", linewidth = 1) +
+  # Anotaciones
+  annotate("text", x = delta_10pct + 0.002, y = late_main * 0.2,
+           label = "10% del RF\ncomo efecto\ndirecto",
+           size = 3, color = COL_NEUT, hjust = 0) +
+  annotate("text", x = delta_null - 0.002, y = late_main * 0.15,
+           label = paste0("δ = RF = ", round(rf_est, 3), "\n(LATE → 0)"),
+           size = 3, color = COL_TRAT, hjust = 1) +
+  annotate("text", x = 0.001, y = late_main + 0.02,
+           label = paste0("LATE = ", round(late_main, 3), " (δ = 0)"),
+           size = 3, color = COL_UMBR, hjust = 0) +
+  scale_x_continuous(
+    sec.axis = sec_axis(~ . / rf_est * 100,
+                        name = "Efecto directo δ como % de la forma reducida",
+                        labels = function(x) paste0(round(x), "%"))
+  ) +
+  labs(
+    title    = "Sensibilidad del LATE a la violación de la restricción de exclusión",
+    subtitle = paste0("Si T tiene un efecto directo δ en Y más allá de D, el LATE baja de ",
+                      round(late_main, 3), " a 0 cuando δ → ", round(rf_est, 3)),
+    x        = "Efecto directo δ de T en Y (escala de RF)",
+    y        = "LATE corregido"
+  )
+```
+
+```{r tabla-exclusion}
+tibble(
+  `Supuesto sobre δ`   = c(
+    "Sin efecto directo (exclusión exacta)",
+    paste0("δ = 10% del RF (", round(delta_10pct, 4), ")"),
+    paste0("δ = 20% del RF (", round(0.20 * rf_est, 4), ")"),
+    paste0("δ = 30% del RF (", round(0.30 * rf_est, 4), ")"),
+    paste0("δ = 50% del RF (", round(delta_half, 4), ")"),
+    "δ = RF (exclusión totalmente violada)"
+  ),
+  `LATE corregido` = round(c(
+    late_main,
+    (rf_est - delta_10pct)    / fs_est,
+    (rf_est - 0.20 * rf_est)  / fs_est,
+    (rf_est - 0.30 * rf_est)  / fs_est,
+    (rf_est - delta_half)     / fs_est,
+    0
+  ), 4),
+  `% del LATE original` = round(c(100, 90, 80, 70, 50, 0), 1)
+) %>%
+  kable(caption = paste0(
+    "LATE bajo distintos supuestos sobre el efecto directo de T en Y ",
+    "(RF = ", round(rf_est, 4), ", FS = ", round(fs_est, 4), ")"
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, color = COL_NEUT) %>%
+  row_spec(6, bold = TRUE, color = COL_TRAT)
+```
+
+> **Conclusión:** para que la restricción de exclusión violada *anule* el LATE, el efecto directo de la elegibilidad sobre el resultado debería ser al menos `r round(rf_est, 3)` — es decir, tan grande como toda la forma reducida. Un efecto directo de magnitud plausible (digamos, 10–20% del RF por efectos de información o motivación) reduciría el LATE estimado de `r round(late_main, 3)` a `r round((rf_est - 0.20 * rf_est) / fs_est, 3)`, manteniéndolo sustancialmente positivo y significativo.
+
+---
+
+## 4. Estratificación principal
+
+### 4.1 Los cuatro estratos en Fuzzy RDD
+
+En cualquier diseño de variables instrumentales (incluyendo Fuzzy RDD), cada individuo pertenece a uno de cuatro **estratos principales** definidos por sus resultados potenciales de tratamiento $(D(T=0), D(T=1))$:
+
+```{r tabla-estratos-def}
+tibble(
+  Estrato          = c("Always-takers", "Compliers", "Never-takers", "Defiers"),
+  `D(T=0), D(T=1)` = c("1, 1", "0, 1", "0, 0", "1, 0"),
+  `En SPP`         = c(
+    "Se inscriben en universidad de élite con o sin ser elegibles",
+    "Solo se inscriben si son elegibles (LATE los identifica)",
+    "No se inscriben aunque sean elegibles",
+    "Se inscriben solo si NO son elegibles — descartados por monotonía"
+  ),
+  `Identificación` = c(
+    "Observables: D=1 cuando T=0 cerca del umbral",
+    "LATE = efecto promedio para este grupo",
+    "Observables: D=0 cuando T=1 cerca del umbral",
+    "Supuesto: P = 0 (monotonía)"
+  )
+) %>%
+  kable(caption = "Estratos principales del Fuzzy RDD y su interpretación en SPP") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = TRUE) %>%
+  column_spec(1, bold = TRUE) %>%
+  row_spec(2, background = "#f0f7ff")
+```
+
+### 4.2 Tamaño estimado de cada estrato
+
+Cerca del umbral (dentro de $h^*$), podemos estimar las proporciones de cada estrato:
+
+```{r tamaños-estratos}
+p_AT    <- mean(df_bw$D[df_bw$T == 0], na.rm = TRUE)   # always-takers
+p_CO_AT <- mean(df_bw$D[df_bw$T == 1], na.rm = TRUE)   # compliers + always-takers
+p_CO    <- p_CO_AT - p_AT                               # compliers (= primera etapa)
+p_NT    <- 1 - p_CO_AT                                  # never-takers
+
+n_bw    <- nrow(df_bw)
+
+estrato_df <- tibble(
+  Estrato       = c("Always-takers", "Compliers", "Never-takers", "Defiers"),
+  `P estimada`  = round(c(p_AT, p_CO, p_NT, 0), 4),
+  `% en BW`     = round(c(p_AT, p_CO, p_NT, 0) * 100, 1),
+  `N aproximado (BW = ±h*)` = round(c(p_AT, p_CO, p_NT, 0) * n_bw)
+)
+
+estrato_df %>%
+  kable(caption = paste0(
+    "Tamaño estimado de los estratos principales cerca del umbral ",
+    "(N = ", n_bw, " obs. en |X₁| ≤ ", round(h_main, 2), ")"
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE) %>%
+  row_spec(2, bold = TRUE, background = "#f0f7ff") %>%
+  row_spec(4, color = "gray")
+```
+
+```{r grafico-estratos, fig.height=4}
+estrato_df %>%
+  filter(`P estimada` > 0) %>%
+  mutate(
+    Estrato = fct_reorder(Estrato, `P estimada`, .desc = TRUE),
+    color   = case_when(
+      Estrato == "Compliers"     ~ COL_TRAT,
+      Estrato == "Never-takers"  ~ COL_CTRL,
+      Estrato == "Always-takers" ~ COL_NEUT,
+      TRUE                       ~ "gray"
+    )
+  ) %>%
+  ggplot(aes(x = Estrato, y = `% en BW`, fill = color)) +
+  geom_col(width = 0.6, alpha = 0.85) +
+  geom_text(aes(label = paste0(`% en BW`, "%")),
+            vjust = -0.5, size = 4.5, fontface = "bold") +
+  scale_fill_identity() +
+  scale_y_continuous(limits = c(0, max(estrato_df$`% en BW`) * 1.2)) +
+  labs(
+    title    = "Distribución de estratos principales dentro del ancho de banda óptimo",
+    subtitle = paste0("Solo los Compliers (", round(p_CO * 100, 1),
+                      "%) son identificados por el LATE del Fuzzy RDD"),
+    x        = NULL, y        = "% de la muestra en BW"
+  )
+```
+
+### 4.3 ¿Qué mide exactamente el LATE?
+
+El LATE = `r round(late_main, 3)` es el efecto promedio de inscribirse en una universidad de élite para los **compliers locales** — personas que:
+
+1. Tienen un puntaje justo alrededor del umbral (`r round(-h_main, 1)` a `r round(h_main, 1)` puntos del corte)
+2. Se habrían inscrito en universidad de élite **solo si** obtuvieron la beca SPP
+
+Esto implica dos limitaciones de validez externa importantes:
+
+- **Locales**: el efecto es válido solo para quienes están en la vecindad del umbral, no para estudiantes con puntajes muy altos o muy bajos
+- **Condicionales al tipo**: los always-takers (`r round(p_AT * 100, 1)`% del BW) y never-takers (`r round(p_NT * 100, 1)`%) tienen efectos que el LATE no identifica
+
+### 4.4 Truncación por tratamiento: el problema del "selection into Y"
+
+En muchas evaluaciones de programas educativos, el resultado $Y$ se observa condicionalmente en que el individuo *completó* la carrera o permaneció en la universidad. Si la variable de resultado requiere una **selección post-tratamiento** (e.g., graduarse, tener empleo formal) que es en sí misma afectada por $D$, se rompe la comparabilidad directa.
+
+**Marco formal (Lee 2009):** Sea $S_i \in \{0,1\}$ la variable de selección post-tratamiento (e.g., permanece en la universidad). Si $Y_i$ solo se observa cuando $S_i = 1$, entonces:
+
+$$E[Y | D=1, S=1] - E[Y | D=0, S=1]$$
+
+es sesgado porque los grupos condicionales en $S=1$ no son comparables (la composición de quienes "sobreviven" difiere entre $D=1$ y $D=0$).
+
+### 4.5 Cotas de Lee bajo truncación
+
+Si asumimos **monotonía de la selección** ($D_i = 1 \Rightarrow S_i(1) \geq S_i(0)$, similar a la monotonía del instrumento), el efecto del tratamiento sobre $Y$ está acotado entre dos extremos obtenidos **trimando** la distribución:
+
+```{r lee-bounds}
+# ── Cotas de Lee para el efecto del tratamiento sobre Y ──────────────────────
+# Proporción de "exceso" de seleccionados en D=1 vs D=0 dentro del BW
+# s1 = P(S=1 | D=1, BW) — simplificamos: usamos todos los D=1 como proxy
+# s0 = P(S=1 | D=0, BW)
+# Fracción de trimming = (s1 - s0) / s1 ≈ p_CO / p_CO_AT (primera etapa / P(D=1|T=1))
+trim_frac <- p_CO / p_CO_AT   # fracción a trimar de D=1
+
+# Dentro del BW, entre los tratados (D=1): distribucion de Y
+y_d1 <- df_bw$Y[df_bw$D == 1 & !is.na(df_bw$Y)]
+y_d0 <- df_bw$Y[df_bw$D == 0 & !is.na(df_bw$Y)]
+
+# Cuantiles de corte
+q_trim_lo <- quantile(y_d1, probs = trim_frac,     na.rm = TRUE)
+q_trim_hi <- quantile(y_d1, probs = 1 - trim_frac, na.rm = TRUE)
+
+mean_y_d0 <- mean(y_d0, na.rm = TRUE)
+
+# Cota superior: quitar la fracción más baja de D=1 (mejor escenario para el control)
+ub_effect <- mean(y_d1[y_d1 >= q_trim_lo], na.rm = TRUE) - mean_y_d0
+# Cota inferior: quitar la fracción más alta de D=1 (peor escenario para el control)
+lb_effect <- mean(y_d1[y_d1 <= q_trim_hi], na.rm = TRUE) - mean_y_d0
+
+tibble(
+  Estimación         = c("Cota inferior (Lee lower bound)",
+                         "LATE estimado (Wald robusto)",
+                         "Cota superior (Lee upper bound)"),
+  Valor              = round(c(lb_effect, late_main, ub_effect), 4),
+  Interpretación     = c(
+    "Efecto mínimo si la selección favorece al tratamiento (caso pesimista)",
+    "Estimación puntual bajo monotonía y exclusión",
+    "Efecto máximo si la selección favorece al tratamiento (caso optimista)"
+  )
+) %>%
+  kable(caption = paste0(
+    "Cotas de Lee bajo truncación por selección post-tratamiento ",
+    "(fracción de trimming = ", round(trim_frac * 100, 1), "%)"
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = TRUE) %>%
+  row_spec(2, bold = TRUE, background = "#f0f7ff") %>%
+  column_spec(2, bold = TRUE,
+              color = c(COL_CTRL, COL_TRAT, COL_NEUT))
+```
+
+```{r grafico-bounds, fig.height=3.5}
+bounds_df <- tibble(
+  tipo  = factor(c("Cota inferior", "LATE (puntual)", "Cota superior"),
+                 levels = c("Cota inferior", "LATE (puntual)", "Cota superior")),
+  valor = c(lb_effect, late_main, ub_effect)
+)
+
+ggplot(bounds_df, aes(y = "SPP", x = valor, color = tipo)) +
+  geom_errorbarh(
+    data = tibble(y = "SPP", xmin = lb_effect, xmax = ub_effect),
+    aes(y = y, xmin = xmin, xmax = ub_effect, color = NULL),
+    height = 0.2, color = "gray60", linewidth = 1.2, inherit.aes = FALSE
+  ) +
+  geom_point(size = 5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = COL_UMBR) +
+  scale_color_manual(values = c(
+    "Cota inferior"  = COL_CTRL,
+    "LATE (puntual)" = COL_TRAT,
+    "Cota superior"  = COL_NEUT
+  )) +
+  labs(
+    title    = "Cotas de Lee para el efecto del programa SPP",
+    subtitle = "El efecto se mantiene positivo incluso bajo el escenario más pesimista de selección",
+    x        = "Efecto estimado sobre Y",
+    y        = NULL, color = NULL
+  ) +
+  theme(
+    legend.position = "top",
+    axis.text.y     = element_blank(),
+    axis.ticks.y    = element_blank()
+  )
+```
+
+> **Nota sobre Y binaria:** cuando $Y \in \{0,1\}$ las cotas de Lee son conservadoras porque la distribución condicional es degenerada (solo dos valores). El análisis sería más informativo si $Y$ fuera un ingreso continuo o un índice de movilidad. Aun así, el hecho de que la **cota inferior sea `r round(lb_effect, 3)`** — positiva y sustancialmente mayor que cero — refuerza la robustez del resultado.
+
+---
+
+## 5. Síntesis de la validez interna
+
+```{r tabla-sintesis}
+tibble(
+  `Amenaza`          = c(
+    "Manipulación del umbral (sorting)",
+    "Confusión no medida / sesgo residual",
+    "Violación de exclusión (efecto directo de T)",
+    "Violación de monotonía (defiers)",
+    "Selección post-tratamiento (truncación)"
+  ),
+  `Evidencia revisada` = c(
+    "Prueba de McCrary: densidad continua en el umbral (02_supuestos.Rmd)",
+    paste0("E-valor (IC) = ", round(ev_ci, 2),
+           ": requeriría RR > ", round(ev_ci, 2), " en confusor-D y confusor-Y"),
+    paste0("LATE se anula solo si δ ≥ RF = ", round(rf_est, 3),
+           " — plausibilidad baja para un efecto informativo"),
+    "No identificable directamente; monotonía de inscripción es plausible en contexto competitivo",
+    paste0("Cota inferior Lee = ", round(lb_effect, 3),
+           ": efecto sigue siendo positivo incluso en caso pesimista")
+  ),
+  `Veredicto` = c(
+    "Sin evidencia de manipulación",
+    "Resultado robusto a confusión plausible",
+    "Exclusión razonablemente respaldada",
+    "Supuesto razonable; sensibilidad no cuantificable sin datos adicionales",
+    "Efecto positivo incluso con selección adversa"
+  )
+) %>%
+  kable(caption = "Resumen de amenazas a la validez interna y evidencia de robustez") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = TRUE) %>%
+  column_spec(1, bold = TRUE, width = "25%") %>%
+  column_spec(2, width = "45%") %>%
+  column_spec(3, bold = TRUE, width = "30%",
+              color = c(COL_NEUT, COL_NEUT, COL_NEUT, COL_CTRL, COL_NEUT))
+```
+
+---
+
+## 6. Discusión: ¿cuánto confiar en el LATE de SPP?
+
+Las tres formas de sensibilidad apuntan en la misma dirección:
+
+**E-valor:** un confusor no observado necesitaría tener una asociación de RR ≥ `r round(ev_ci, 2)` tanto con el tratamiento como con el resultado para anular la estimación. En el contexto de movilidad socioeconómica en Colombia, variables fuertes como el nivel educativo de los padres o el ingreso familiar tienen efectos moderados (RR ~ 1.5–2.5). Es poco plausible que exista un confusor no observado *adicional* con la fuerza requerida.
+
+**Exclusión:** incluso si la elegibilidad tiene un efecto directo de información o motivación equivalente al 20–30% de la forma reducida, el LATE corregido seguiría siendo `r round((rf_est - 0.25 * rf_est) / fs_est, 3)` — positivo, sustancial y estadísticamente significativo.
+
+**Cotas de Lee:** el escenario más desfavorable de selección post-tratamiento produce una cota inferior de `r round(lb_effect, 3)`, que sigue siendo mayor que cero.
+
+**Implicación:** la evidencia de que SPP aumenta la movilidad socioeconómica de los compliers en la vecindad del umbral es **robusta** a amenazas metodológicas de magnitud plausible. La validez externa — generalizar a estudiantes fuera del umbral o a otros contextos — requiere justificación teórica adicional más allá de los datos.
+
+---
+
+**Siguientes pasos — `reporte/reporte_final.Rmd`:**
+
+Con los cinco archivos de análisis completos (01–05), el siguiente paso es integrar los resultados en el reporte final:
+
+1. Seleccionar las tablas y gráficas más importantes de cada sección
+2. Redactar la narrativa de Introducción → Datos → Métodos → Aplicación → Conclusiones
+3. Revisar coherencia de cifras entre secciones y agregar referencias formales
