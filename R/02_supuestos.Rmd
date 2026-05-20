@@ -1,0 +1,439 @@
+---
+title: "Validación de Supuestos — Ser Pilo Paga"
+subtitle: "Movilidad Social y Educación de Élite | Métodos Analíticos · ITAM 2026-I"
+author: "Avril Salazar · Paulina Garza · Othoniel Reyes"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi        = 150
+)
+set.seed(999)
+```
+
+---
+
+## 0. Configuración
+
+```{r paquetes}
+library(tidyverse)
+library(hrbrthemes)
+library(patchwork)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(rdrobust)
+library(rddensity)
+
+theme_set(
+  theme_ipsum_rc(base_size = 12, plot_title_size = 14, axis_title_size = 11)
+)
+
+COL_CTRL <- "#4A6FA5"
+COL_TRAT <- "#E07A5F"
+COL_UMBR <- "#2D2D2D"
+
+df <- read_csv("../data/spp_microset.csv", show_col_types = FALSE)
+```
+
+---
+
+## Mapa de supuestos del diseño Fuzzy RDD
+
+Para que el estimador IV/Fuzzy RDD identifique causalmente el LATE necesitamos verificar cuatro supuestos. Tres son parcialmente verificables con los datos; uno es de índole teórica.
+
+| # | Supuesto | Verificable | Sección |
+|---|---|---|---|
+| 1 | **Continuidad de la densidad** — no manipulación de X1 en el umbral | Sí (prueba McCrary) | §1 |
+| 2 | **Balance de covariables** — no discontinuidad en variables pre-tratamiento | Sí (rdrobust por covariable) | §2 |
+| 3 | **Ausencia de efectos en umbrales placebo** — el umbral real es el único que importa | Sí (falsos umbrales) | §3 |
+| 4 | **Exclusión y monotonía** — el umbral afecta Y solo a través de D; no hay defiers | No (argumento teórico) | §4 |
+
+---
+
+## 1. Continuidad de la densidad: prueba de McCrary
+
+Si los estudiantes pudieran manipular su puntaje para quedar justo encima del corte de elegibilidad, observaríamos una masa inusual de observaciones en X1 = 0+. La prueba de McCrary (implementada con `rddensity`) testa formalmente la hipótesis nula de continuidad.
+
+### Resultado formal
+
+```{r mccrary-test}
+rdd_test <- rddensity(X = df$X1)
+summary(rdd_test)
+```
+
+```{r mccrary-pval, include=FALSE}
+# Extraemos el p-valor para anotación (slots estándar de rddensity >= 2.3)
+pval_rdd  <- tryCatch(rdd_test$test$p_jk,  error = function(e) NA_real_)
+tstat_rdd <- tryCatch(rdd_test$test$t_jk,  error = function(e) NA_real_)
+```
+
+### Visualización
+
+```{r mccrary-plot}
+df_zoom <- df %>% filter(abs(X1) <= 60)
+
+lbl_test <- if (!is.na(pval_rdd)) {
+  paste0("T = ", round(tstat_rdd, 3), "   p = ", round(pval_rdd, 3))
+} else {
+  "Ver tabla de test arriba"
+}
+
+ggplot(df_zoom, aes(x = X1)) +
+  geom_histogram(
+    aes(y = after_stat(density), fill = X1 >= 0),
+    bins = 60, color = "white", linewidth = 0.2, alpha = 0.5
+  ) +
+  stat_density(
+    data = df_zoom %>% filter(X1 < 0),
+    geom = "line", color = COL_CTRL, linewidth = 1.0, bw = "SJ", trim = TRUE
+  ) +
+  stat_density(
+    data = df_zoom %>% filter(X1 >= 0),
+    geom = "line", color = COL_TRAT, linewidth = 1.0, bw = "SJ", trim = TRUE
+  ) +
+  geom_vline(xintercept = 0, color = COL_UMBR, linewidth = 0.9, linetype = "dashed") +
+  annotate("label", x = -58, y = Inf, vjust = 1.8, hjust = 0,
+           size = 3.5, fill = "white", color = COL_UMBR,
+           label = lbl_test) +
+  scale_fill_manual(
+    values = c("FALSE" = COL_CTRL, "TRUE" = COL_TRAT), guide = "none"
+  ) +
+  labs(
+    title    = "Prueba de McCrary: continuidad de la densidad en X1 = 0",
+    subtitle = "p > 0.05 → no se rechaza continuidad → sin evidencia de manipulación",
+    x        = "Puntaje relativo al umbral (X1)",
+    y        = "Densidad estimada"
+  )
+```
+
+> **Decisión:** Si p < 0.05 rechazamos la continuidad y el diseño RD está comprometido. Si p ≥ 0.05, no tenemos evidencia estadística de que los estudiantes hayan podido manipular el puntaje.
+
+---
+
+## 2. Balance de covariables pre-tratamiento
+
+Estimamos `rdrobust` usando cada covariable como variable de resultado. Si el diseño es válido, no debería haber discontinuidad en ninguna covariable en X1 = 0 — estas variables fueron determinadas **antes** del examen.
+
+### Tabla de balance formal
+
+```{r balance-formal}
+covs <- list(
+  "Mujer (icfes_female)"       = "icfes_female",
+  "Edad (icfes_age)"           = "icfes_age",
+  "Minoría URM (icfes_urm)"    = "icfes_urm",
+  "Estrato (icfes_stratum)"    = "icfes_stratum",
+  "Tam. hogar (icfes_famsize)" = "icfes_famsize"
+)
+
+balance_tbl <- map_df(names(covs), function(label) {
+  var   <- covs[[label]]
+  mask  <- !is.na(df[[var]])
+  y_sub <- df[[var]][mask]
+  x_sub <- df$X1[mask]
+
+  fit <- tryCatch(rdrobust(y = y_sub, x = x_sub), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+
+  tibble(
+    Covariable   = label,
+    Estimación   = fit$coef[1],
+    `Err. est.`  = fit$se[3],
+    `p-valor`    = fit$pv[3],
+    `IC inf.`    = fit$ci[3, 1],
+    `IC sup.`    = fit$ci[3, 2],
+    `h óptimo`   = fit$bws[1, 1]
+  )
+})
+
+balance_tbl %>%
+  mutate(
+    across(c(Estimación, `Err. est.`, `p-valor`, `IC inf.`, `IC sup.`),
+           ~ round(.x, 4)),
+    `h óptimo`    = round(`h óptimo`, 2),
+    Significativo = ifelse(`p-valor` < 0.05, "Sí ⚠️", "No ✓")
+  ) %>%
+  kable(caption = "Balance de covariables: discontinuidad estimada en X1 = 0 (rdrobust)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  column_spec(8, bold = TRUE)
+```
+
+### Forest plot de balance
+
+```{r balance-forest, fig.height=4}
+balance_tbl %>%
+  mutate(
+    color = ifelse(abs(Estimación / `Err. est.`) > 1.96, "Significativo", "No significativo"),
+    Covariable = fct_reorder(Covariable, Estimación)
+  ) %>%
+  ggplot(aes(x = Estimación, y = Covariable, color = color)) +
+  geom_vline(xintercept = 0, color = COL_UMBR, linewidth = 0.8, linetype = "dashed") +
+  geom_errorbarh(
+    aes(xmin = `IC inf.`, xmax = `IC sup.`),
+    height = 0.25, linewidth = 0.8
+  ) +
+  geom_point(size = 3.5) +
+  scale_color_manual(
+    values = c("No significativo" = COL_CTRL, "Significativo" = "#C0392B")
+  ) +
+  labs(
+    title    = "Balance de covariables en el umbral",
+    subtitle = "Intervalos de confianza que cruzan cero indican ausencia de discontinuidad",
+    x        = "Estimación en el umbral (rdrobust, IC 95%)",
+    y        = NULL,
+    color    = NULL
+  ) +
+  theme(legend.position = "top")
+```
+
+> **Lectura:** Si todos los intervalos de confianza cruzan la línea de cero, concluimos que no hay discontinuidades en covariables pre-tratamiento — el umbral no parece afectar variables que deberían ser independientes del programa.
+
+---
+
+## 3. Verificación en umbrales placebo
+
+Si el umbral en X1 = 0 es la única fuente de discontinuidad, no deberíamos ver efectos significativos en cortes falsos. Probamos en X1 = {−30, −20, −10, −5, 5, 10, 20, 30} para Y y para D.
+
+```{r placebo-tests}
+placebos <- c(-30, -20, -10, -5, 5, 10, 20, 30)
+
+run_placebo <- function(outcome_var, placebos) {
+  map_df(placebos, function(c0) {
+    fit <- tryCatch(
+      rdrobust(y = df[[outcome_var]], x = df$X1, c = c0),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) return(NULL)
+    tibble(
+      Umbral    = c0,
+      Est.      = fit$coef[1],
+      SE        = fit$se[3],
+      `p-valor` = fit$pv[3],
+      CI_l      = fit$ci[3, 1],
+      CI_u      = fit$ci[3, 2]
+    )
+  })
+}
+
+placebos_Y <- run_placebo("Y", placebos)
+placebos_D <- run_placebo("D", placebos)
+```
+
+### Tabla de placebos (resultado Y)
+
+```{r placebo-tabla}
+placebos_Y %>%
+  mutate(
+    across(c(Est., SE, `p-valor`, CI_l, CI_u), ~ round(.x, 4)),
+    Significativo = ifelse(`p-valor` < 0.05, "Sí ⚠️", "No ✓")
+  ) %>%
+  kable(caption = "Efectos estimados en umbrales placebo — resultado Y") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  column_spec(7, bold = TRUE)
+```
+
+### Gráfica de placebos
+
+```{r placebo-plot, fig.height=5}
+bind_rows(
+  placebos_Y %>% mutate(Variable = "Resultado (Y)"),
+  placebos_D %>% mutate(Variable = "Tratamiento (D)")
+) %>%
+  mutate(
+    sig   = ifelse(`p-valor` < 0.05, "p < 0.05", "p ≥ 0.05"),
+    color = ifelse(sig == "p < 0.05", "#C0392B", COL_CTRL)
+  ) %>%
+  ggplot(aes(x = Umbral, y = Est.)) +
+  geom_hline(yintercept = 0, color = COL_UMBR, linewidth = 0.7, linetype = "dashed") +
+  geom_vline(xintercept = 0, color = COL_TRAT, linewidth = 0.6,
+             linetype = "dotted", alpha = 0.6) +
+  geom_errorbar(aes(ymin = CI_l, ymax = CI_u), width = 0.8,
+                color = COL_CTRL, linewidth = 0.7) +
+  geom_point(aes(color = sig), size = 3) +
+  scale_color_manual(
+    values = c("p < 0.05" = "#C0392B", "p ≥ 0.05" = COL_CTRL)
+  ) +
+  scale_x_continuous(breaks = placebos) +
+  facet_wrap(~Variable, scales = "free_y") +
+  labs(
+    title    = "Efectos estimados en umbrales placebo",
+    subtitle = "El umbral real (X1 = 0) no aparece aquí — los placebos deben ser no significativos",
+    x        = "Umbral placebo",
+    y        = "Estimación (IC 95%)",
+    color    = NULL
+  ) +
+  theme(legend.position = "top")
+```
+
+> **Interpretación:** Si algún umbral placebo muestra p < 0.05, puede indicar que hay otros mecanismos que generan discontinuidades en el puntaje — lo que debilitaría la interpretación causal del umbral real.
+
+---
+
+## 4. Selección del ancho de banda óptimo
+
+El ancho de banda (h) controla el sesgo-varianza del estimador RDD. Anchos pequeños usan pocas obs. (alta varianza), anchos grandes introducen sesgo por la heterogeneidad fuera del umbral. `rdbwselect` computa varios selectores óptimos.
+
+### Selectores disponibles
+
+```{r bw-select}
+bw_sel <- rdbwselect(y = df$Y, x = df$X1, all = TRUE)
+summary(bw_sel)
+```
+
+```{r bw-tabla}
+bw_matrix <- bw_sel$bws
+# Accedemos por índice de columna — los nombres varían entre versiones de rdrobust
+tibble(
+  Selector   = rownames(bw_matrix),
+  `h (main)` = round(bw_matrix[, 1], 2),
+  `b (bias)`  = round(bw_matrix[, 2], 2)
+) %>%
+  mutate(Descripción = case_when(
+    Selector == "mserd"  ~ "MSE-óptimo, mismo h a ambos lados (recomendado)",
+    Selector == "msetwo" ~ "MSE-óptimo, h diferente a cada lado",
+    Selector == "cerrd"  ~ "CER-óptimo, mismo h (para IC de cobertura correcta)",
+    Selector == "certwo" ~ "CER-óptimo, h diferente a cada lado",
+    TRUE                 ~ Selector
+  )) %>%
+  select(Selector, Descripción, `h (main)`, `b (bias)`) %>%
+  kable(caption = "Anchos de banda óptimos según diferentes criterios (rdbwselect)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Sensibilidad de la estimación al ancho de banda
+
+El estimador debería ser **estable** en un rango razonable de h alrededor del óptimo. Una estimación que cambia drásticamente con h pequeñas modificaciones indica fragilidad.
+
+```{r bw-sensitivity, fig.height=5}
+h_range <- seq(4, 60, by = 2)
+h_opt   <- bw_sel$bws["mserd", 1]   # columna 1 = h principal
+
+results_bw <- map_df(h_range, function(h) {
+  fit <- tryCatch(
+    rdrobust(y = df$Y, x = df$X1, h = h),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NULL)
+  tibble(
+    h    = h,
+    coef = fit$coef[1],
+    ci_l = fit$ci[3, 1],
+    ci_u = fit$ci[3, 2]
+  )
+})
+
+ggplot(results_bw, aes(x = h)) +
+  geom_ribbon(aes(ymin = ci_l, ymax = ci_u), alpha = 0.15, fill = COL_TRAT) +
+  geom_line(aes(y = coef), color = COL_TRAT, linewidth = 0.9) +
+  geom_hline(yintercept = 0, color = COL_UMBR, linewidth = 0.7, linetype = "dashed") +
+  geom_vline(xintercept = h_opt, color = COL_CTRL, linewidth = 0.9, linetype = "dotted") +
+  annotate(
+    "label", x = h_opt, y = Inf, vjust = 1.8, hjust = -0.1,
+    size = 3.5, fill = "white", color = COL_CTRL,
+    label = paste0("h* = ", round(h_opt, 1), " (MSE-óptimo)")
+  ) +
+  labs(
+    title    = "Sensibilidad del estimador al ancho de banda",
+    subtitle = "Una línea horizontal y estable indica robustez — el IC ampliándose es esperado en h pequeños",
+    x        = "Ancho de banda h",
+    y        = "Estimación (forma reducida, IC 95%)"
+  )
+```
+
+> **Qué esperamos:** La estimación debe ser razonablemente estable alrededor de h* y no depender críticamente de la elección exacta. El CI se amplía para h pequeños (pocas obs.) y el sesgo crece para h grandes — el óptimo balancea ambos.
+
+---
+
+## 5. Supuestos no verificables: discusión teórica
+
+Dos supuestos del diseño Fuzzy RDD no pueden verificarse estadísticamente con los datos disponibles. Los discutimos con base en el contexto institucional del programa SPP.
+
+### 5.1 Exclusión del instrumento
+
+**Supuesto:** el umbral (superar el corte en Saber 11) afecta el resultado Y **únicamente a través** de inscribirse en universidad de élite (D). No debe haber otro canal por el cual cruzar el umbral afecte Y independientemente de D.
+
+**Argumento:** El umbral es un corte administrativo en el puntaje del examen. No conlleva ningún beneficio adicional más allá de la beca SPP — no hay reconocimiento público, cambio de estatus escolar ni intervención paralela. El riesgo principal de violación sería que el hecho de *saber* que uno calificó para la beca modifique el comportamiento (p.ej., mayor motivación, cambio de carrera) independientemente de si finalmente se inscribe. Londoño-Vélez et al. (2020) argumentan que este riesgo es mínimo dado el carácter administrativo del umbral.
+
+### 5.2 Monotonía (ausencia de defiers)
+
+**Supuesto:** No hay estudiantes que se inscriban en universidad de élite *precisamente porque no son elegibles* para SPP — es decir, no hay defiers (D(1) < D(0)).
+
+**Argumento:** Es difícil imaginar por qué alguien rechazaría una universidad de élite solo porque recibió la beca. En la muestra, el número de observaciones con T = 0 y D = 1 (potenciales always-takers o defiers) es pequeño, lo que sugiere que si existen defiers, son muy pocos.
+
+```{r defiers}
+# Estimamos los always-takers (potencial límite superior de defiers)
+n_T0_D1 <- sum(df$T == 0 & df$D == 1, na.rm = TRUE)
+n_total  <- nrow(df)
+
+cat(sprintf(
+  "Observaciones con T=0 y D=1: %d (%.2f%% del total)\n",
+  n_T0_D1, n_T0_D1 / n_total * 100
+))
+cat("→ Si hubiera defiers, estarían en este grupo (junto con always-takers).\n")
+cat("→ Un porcentaje pequeño apoya la plausibilidad del supuesto de monotonía.\n")
+```
+
+---
+
+## Resumen de supuestos
+
+```{r resumen}
+# Extraemos resultados calculados para la tabla
+mccrary_p  <- tryCatch(round(rdd_test$test$p_jk, 4),  error = function(e) NA)
+n_sig_bal  <- sum(balance_tbl$`p-valor` < 0.05, na.rm = TRUE)
+n_sig_plac <- sum(placebos_Y$`p-valor` < 0.05, na.rm = TRUE)
+
+tibble(
+  Supuesto = c(
+    "1. Continuidad de la densidad (McCrary)",
+    "2. Balance de covariables pre-tratamiento",
+    "3. Ausencia de efectos en placebos",
+    "4a. Exclusión del instrumento",
+    "4b. Monotonía (sin defiers)"
+  ),
+  Resultado = c(
+    ifelse(!is.na(mccrary_p),
+      paste0("p = ", mccrary_p,
+             ifelse(mccrary_p >= 0.05, " → No se rechaza H₀ ✓",
+                                        " → Se rechaza H₀ ⚠️")),
+      "Ver summary(rdd_test) arriba"),
+    ifelse(n_sig_bal == 0,
+      paste0("0 de ", nrow(balance_tbl), " covariables significativas ✓"),
+      paste0(n_sig_bal, " de ", nrow(balance_tbl),
+             " covariables con discontinuidad ⚠️")),
+    ifelse(n_sig_plac == 0,
+      paste0("0 de ", length(placebos), " placebos significativos ✓"),
+      paste0(n_sig_plac, " de ", length(placebos), " placebos significativos ⚠️")),
+    "No verificable — argumento institucional (ver §5.1)",
+    paste0("No verificable — always-takers/defiers: ",
+           round(n_T0_D1 / n_total * 100, 2), "% del total (ver §5.2)")
+  )
+) %>%
+  kable(caption = "Resumen de validación de supuestos del diseño Fuzzy RDD") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE) %>%
+  column_spec(1, bold = TRUE, width = "40%") %>%
+  column_spec(2, width = "60%")
+```
+
+**Siguientes pasos — `03_fuzzy_rdd.Rmd`:**
+
+1. Estimación del **LATE** con `rdrobust(y = df$Y, x = df$X1, fuzzy = df$D)` — modelo principal
+2. Análisis de robustez: polinomios locales de orden 1, 2 y 3
+3. Diferentes anchos de banda (h* × 0.5, h*, h* × 1.5, h* × 2)
+4. Estimación de la **primera etapa** formal (F-estadístico del instrumento)
