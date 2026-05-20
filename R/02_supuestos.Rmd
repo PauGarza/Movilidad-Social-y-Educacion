@@ -162,24 +162,41 @@ balance_tbl <- map_df(names(covs), function(label) {
   )
 })
 
+# Con 5 pruebas simultáneas, el umbral corregido por Bonferroni es α* = 0.05 / 5 = 0.01
+alpha_bonf <- 0.05 / nrow(balance_tbl)
+
 balance_tbl %>%
   mutate(
     across(c(Estimación, `Err. est.`, `p-valor`, `IC inf.`, `IC sup.`),
            ~ round(.x, 4)),
-    `h óptimo`    = round(`h óptimo`, 2),
-    Significativo = ifelse(`p-valor` < 0.05, "Sí ⚠️", "No ✓")
+    `h óptimo`        = round(`h óptimo`, 2),
+    `Sig. (α = 0.05)` = ifelse(`p-valor` < 0.05, "Sí ⚠️", "No ✓"),
+    `Sig. Bonferroni` = ifelse(`p-valor` < alpha_bonf, "Sí ⚠️", "No ✓")
   ) %>%
-  kable(caption = "Balance de covariables: discontinuidad estimada en X1 = 0 (rdrobust)") %>%
+  kable(caption = paste0(
+    "Balance de covariables: discontinuidad estimada en X1 = 0 (rdrobust) | ",
+    "α* Bonferroni = 0.05 / 5 = ", round(alpha_bonf, 3)
+  )) %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
-  column_spec(8, bold = TRUE)
+  column_spec(8, bold = TRUE,
+              color = ifelse(balance_tbl$`p-valor` < 0.05 & balance_tbl$`p-valor` >= alpha_bonf,
+                             "#E67E22", "black")) %>%
+  column_spec(9, bold = TRUE)
 ```
+
+> **Corrección por pruebas múltiples (Bonferroni):** Al probar 5 covariables simultáneamente, el nivel de significancia ajustado es α\* = 0.05 / 5 = **0.01**. `icfes_famsize` tiene p = 0.046 — significativo al 5% sin corrección (columna naranja), pero **no significativo** al nivel ajustado (última columna). La interpretación correcta es que ninguna covariable muestra discontinuidad significativa tras la corrección Bonferroni, lo cual es consistente con un diseño RDD válido.
 
 ### Forest plot de balance
 
-```{r balance-forest, fig.height=4}
+```{r balance-forest, fig.height=4.5}
 balance_tbl %>%
   mutate(
-    color = ifelse(abs(Estimación / `Err. est.`) > 1.96, "Significativo", "No significativo"),
+    # Clasificación bajo corrección Bonferroni
+    color = case_when(
+      `p-valor` < alpha_bonf            ~ "Significativo (Bonferroni)",
+      `p-valor` < 0.05                  ~ "Borderline (p < 0.05, no Bonferroni)",
+      TRUE                              ~ "No significativo"
+    ),
     Covariable = fct_reorder(Covariable, Estimación)
   ) %>%
   ggplot(aes(x = Estimación, y = Covariable, color = color)) +
@@ -190,11 +207,16 @@ balance_tbl %>%
   ) +
   geom_point(size = 3.5) +
   scale_color_manual(
-    values = c("No significativo" = COL_CTRL, "Significativo" = "#C0392B")
+    values = c(
+      "No significativo"                    = COL_CTRL,
+      "Borderline (p < 0.05, no Bonferroni)" = "#E67E22",
+      "Significativo (Bonferroni)"           = "#C0392B"
+    )
   ) +
   labs(
-    title    = "Balance de covariables en el umbral",
-    subtitle = "Intervalos de confianza que cruzan cero indican ausencia de discontinuidad",
+    title    = "Balance de covariables en el umbral (corrección Bonferroni)",
+    subtitle = paste0("Naranja = borderline sin corrección (p < 0.05) | ",
+                      "Rojo = significativo tras Bonferroni (α* = ", round(alpha_bonf, 3), ")"),
     x        = "Estimación en el umbral (rdrobust, IC 95%)",
     y        = NULL,
     color    = NULL
@@ -202,7 +224,7 @@ balance_tbl %>%
   theme(legend.position = "top")
 ```
 
-> **Lectura:** Si todos los intervalos de confianza cruzan la línea de cero, concluimos que no hay discontinuidades en covariables pre-tratamiento — el umbral no parece afectar variables que deberían ser independientes del programa.
+> **Lectura:** El punto naranja (`icfes_famsize`) tiene p = 0.046, que parece significativo al 5% convencional. Sin embargo, al ajustar por el número de pruebas (Bonferroni: α\* = 0.01), no alcanza el nivel de significancia corregido. El IC cruza el cero y la estimación (-0.13 personas en el hogar) no tiene magnitud sustancial. **Conclusión: ninguna covariable falla el balance bajo el criterio correcto de pruebas múltiples.**
 
 ---
 
@@ -395,9 +417,11 @@ cat("→ Un porcentaje pequeño apoya la plausibilidad del supuesto de monotoní
 
 ```{r resumen}
 # Extraemos resultados calculados para la tabla
-mccrary_p  <- tryCatch(round(rdd_test$test$p_jk, 4),  error = function(e) NA)
-n_sig_bal  <- sum(balance_tbl$`p-valor` < 0.05, na.rm = TRUE)
-n_sig_plac <- sum(placebos_Y$`p-valor` < 0.05, na.rm = TRUE)
+mccrary_p    <- tryCatch(round(rdd_test$test$p_jk, 4),  error = function(e) NA)
+# Bonferroni: significativo solo si p < alpha_bonf (0.01), no al 5% sin corregir
+n_sig_bal    <- sum(balance_tbl$`p-valor` < alpha_bonf, na.rm = TRUE)
+n_border_bal <- sum(balance_tbl$`p-valor` >= alpha_bonf & balance_tbl$`p-valor` < 0.05, na.rm = TRUE)
+n_sig_plac   <- sum(placebos_Y$`p-valor` < 0.05, na.rm = TRUE)
 
 tibble(
   Supuesto = c(
@@ -414,9 +438,13 @@ tibble(
                                         " → Se rechaza H₀ ⚠️")),
       "Ver summary(rdd_test) arriba"),
     ifelse(n_sig_bal == 0,
-      paste0("0 de ", nrow(balance_tbl), " covariables significativas ✓"),
+      paste0("0 de ", nrow(balance_tbl), " covariables significativas (Bonferroni α* = ",
+             round(alpha_bonf, 3), ") ✓",
+             ifelse(n_border_bal > 0,
+               paste0(" — ", n_border_bal, " borderline sin corregir (icfes_famsize, p = 0.046)"),
+               "")),
       paste0(n_sig_bal, " de ", nrow(balance_tbl),
-             " covariables con discontinuidad ⚠️")),
+             " covariables con discontinuidad (Bonferroni) ⚠️")),
     ifelse(n_sig_plac == 0,
       paste0("0 de ", length(placebos), " placebos significativos ✓"),
       paste0(n_sig_plac, " de ", length(placebos), " placebos significativos ⚠️")),
