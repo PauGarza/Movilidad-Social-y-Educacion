@@ -1,0 +1,607 @@
+---
+title: "Análisis Exploratorio — Ser Pilo Paga"
+subtitle: "Movilidad Social y Educación de Élite | Métodos Analíticos · ITAM 2026-I"
+author: "Avril Salazar · Paulina Garza · Othoniel Reyes"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi        = 150
+)
+set.seed(999)
+```
+
+---
+
+## 0. Configuración
+
+```{r paquetes}
+library(tidyverse)    # manipulación y visualización
+library(hrbrthemes)   # temas minimalistas — instalar con: install.packages("hrbrthemes")
+library(patchwork)    # combinar múltiples gráficas en un layout
+library(scales)       # formateo de ejes (porcentajes, comas)
+library(knitr)        # tablas en el documento
+library(kableExtra)   # estilo avanzado de tablas HTML
+library(rdrobust)     # herramientas de RDD: rdplot, rdrobust, rdbwselect
+library(rddensity)    # prueba de densidad de McCrary
+
+# Si es la primera vez que usas hrbrthemes, ejecuta esto UNA sola vez y reinicia R:
+# hrbrthemes::import_roboto_condensed()
+
+theme_set(
+  theme_ipsum_rc(base_size = 12, plot_title_size = 14, axis_title_size = 11)
+)
+
+# Paleta de colores del proyecto
+COL_CTRL <- "#4A6FA5"   # azul acero  — por debajo del umbral (no elegible)
+COL_TRAT <- "#E07A5F"   # terracota   — por encima del umbral (elegible SPP)
+COL_UMBR <- "#2D2D2D"   # casi negro  — línea del umbral
+```
+
+> **¿Por qué `hrbrthemes`?**
+> Usa tipografía Roboto Condensed y elimina elementos visuales innecesarios (fondos grises, bordes), produciendo gráficas de estilo publicación académica con una sola línea: `theme_ipsum_rc()`.
+
+---
+
+## 1. Carga y estructura de los datos
+
+Los datos provienen del paquete de replicación de Cattaneo, Idrobo & Titiunik (2024) para *A Practical Introduction to Regression Discontinuity Designs* (Cambridge University Press). El conjunto original es de Londoño-Vélez et al. (2020/2025) sobre el programa Ser Pilo Paga (SPP) en Colombia.
+
+```{r carga}
+df <- read_csv("../data/spp_microset.csv", show_col_types = FALSE)
+
+cat("Dimensiones:", nrow(df), "observaciones ×", ncol(df), "variables\n")
+glimpse(df)
+```
+
+### Diccionario de variables
+
+| Variable | Rol en el diseño | Descripción |
+|---|---|---|
+| `X1` | **Variable forzosa** (*running variable*) | Puntaje Saber 11 **relativo al umbral** (0 = corte de elegibilidad SPP) |
+| `T` | **Instrumento** (Z en notación IV) | 1 si el estudiante supera el umbral → elegible para la beca |
+| `D` | **Tratamiento** | 1 si se inscribió efectivamente en una universidad de élite acreditada |
+| `Y` | **Resultado** | Variable de interés (e.g., graduación, empleo formal) |
+| `icfes_female` | Covariable pre-tratamiento | 1 = mujer |
+| `icfes_age` | Covariable pre-tratamiento | Edad al presentar el examen |
+| `icfes_urm` | Covariable pre-tratamiento | 1 = minoría subrepresentada (*underrepresented minority*) |
+| `icfes_stratum` | Covariable pre-tratamiento | Estrato socioeconómico (1 = más bajo, 6 = más alto) |
+| `icfes_famsize` | Covariable pre-tratamiento | Número de personas en el hogar |
+
+> **Diseño Fuzzy RDD:** `T` es el instrumento (superar el umbral) y `D` es el tratamiento real. No todos los elegibles se inscriben, de ahí el carácter *fuzzy*. El LATE se estima como el cociente del salto en Y sobre el salto en D en el umbral.
+
+### Valores faltantes
+
+```{r missing}
+df %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "faltantes") %>%
+  mutate(porcentaje = paste0(round(faltantes / nrow(df) * 100, 2), "%")) %>%
+  kable(caption = "Valores faltantes por variable") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+```
+
+---
+
+## 2. Estadísticas descriptivas
+
+Comparamos medias de cada variable entre estudiantes elegibles (T = 1) y no elegibles (T = 0). **Advertencia:** estas diferencias no son causales — mezclan el efecto del programa con el hecho de que los elegibles tienen puntajes más altos.
+
+```{r descriptivas}
+df %>%
+  group_by(Grupo = ifelse(T == 1, "Elegible (T = 1)", "No elegible (T = 0)")) %>%
+  summarise(
+    n                 = n(),
+    `X1 media`        = round(mean(X1, na.rm = TRUE), 2),
+    `Toma D (%)`      = round(mean(D, na.rm = TRUE) * 100, 1),
+    `Resultado Y (%)` = round(mean(Y, na.rm = TRUE) * 100, 1),
+    `Mujeres (%)`     = round(mean(icfes_female, na.rm = TRUE) * 100, 1),
+    `Edad media`      = round(mean(icfes_age, na.rm = TRUE), 1),
+    `URM (%)`         = round(mean(icfes_urm, na.rm = TRUE) * 100, 1),
+    `Estrato medio`   = round(mean(icfes_stratum, na.rm = TRUE), 2),
+    `Tam. hogar`      = round(mean(icfes_famsize, na.rm = TRUE), 2)
+  ) %>%
+  kable(caption = "Estadísticas descriptivas por elegibilidad SPP") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+## 3. Variable forzosa: distribución alrededor del umbral
+
+La variable forzosa `X1` está centrada en 0: valores positivos = estudiantes elegibles. El primer diagnóstico de cualquier diseño RD es verificar que la distribución sea **continua** en ese punto. Un pico o vacío justo en 0 sugeriría que los estudiantes manipularon su puntaje para quedar encima del corte.
+
+```{r histograma-X1}
+ggplot(df, aes(x = X1, fill = factor(T))) +
+  geom_histogram(bins = 80, color = "white", linewidth = 0.2, alpha = 0.85,
+                 position = "identity") +
+  geom_vline(xintercept = 0, color = COL_UMBR, linewidth = 0.9, linetype = "dashed") +
+  annotate("text", x = 3, y = Inf, label = "Umbral SPP",
+           vjust = 2, hjust = 0, size = 3.5, color = COL_UMBR, fontface = "italic") +
+  scale_fill_manual(
+    values = c("0" = COL_CTRL, "1" = COL_TRAT),
+    labels = c("0" = "No elegible (T = 0)", "1" = "Elegible (T = 1)")
+  ) +
+  scale_x_continuous(labels = label_number()) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title    = "Distribución del puntaje Saber 11 relativo al umbral",
+    subtitle = "La línea punteada indica el corte de elegibilidad SPP (X1 = 0)",
+    x        = "Puntaje relativo al umbral (X1)",
+    y        = "Frecuencia",
+    fill     = NULL
+  ) +
+  theme(legend.position = "top")
+```
+
+```{r densidad-X1}
+ggplot(df, aes(x = X1, color = factor(T), fill = factor(T))) +
+  geom_density(alpha = 0.15, linewidth = 0.9) +
+  geom_vline(xintercept = 0, color = COL_UMBR, linewidth = 0.9, linetype = "dashed") +
+  scale_color_manual(
+    values = c("0" = COL_CTRL, "1" = COL_TRAT),
+    labels = c("No elegible", "Elegible")
+  ) +
+  scale_fill_manual(
+    values = c("0" = COL_CTRL, "1" = COL_TRAT),
+    labels = c("No elegible", "Elegible")
+  ) +
+  labs(
+    title    = "Densidad estimada del puntaje (X1)",
+    subtitle = "Un salto en X1 = 0 señalaría manipulación — la prueba formal (McCrary) es en 02_supuestos.Rmd",
+    x        = "Puntaje relativo al umbral (X1)",
+    y        = "Densidad estimada",
+    color    = NULL, fill = NULL
+  ) +
+  theme(legend.position = "top")
+```
+
+### Observaciones disponibles por ventana alrededor del umbral
+
+En RDD solo importan las observaciones dentro del **ancho de banda** óptimo. Esta tabla muestra cuántos datos tenemos a cada distancia del umbral — el dato clave para anticipar la precisión del estimador.
+
+```{r obs-por-ventana}
+ventanas <- c(5, 10, 20, 30)
+
+tibble(
+  Ventana  = paste0("±", ventanas),
+  `N total` = map_int(ventanas, ~ sum(abs(df$X1) <= .x)),
+  `N izq.`  = map_int(ventanas, ~ sum(df$X1 >= -.x & df$X1 < 0)),
+  `N der.`  = map_int(ventanas, ~ sum(df$X1 >= 0  & df$X1 <= .x)),
+  `% del total` = map_chr(ventanas, ~ paste0(
+    round(sum(abs(df$X1) <= .x) / nrow(df) * 100, 1), "%"
+  ))
+) %>%
+  add_row(
+    Ventana       = "Total",
+    `N total`     = nrow(df),
+    `N izq.`      = sum(df$X1 < 0),
+    `N der.`      = sum(df$X1 >= 0),
+    `% del total` = "100%"
+  ) %>%
+  kable(
+    caption = "Observaciones disponibles por ventana alrededor del umbral (X1 = 0)",
+    format.args = list(big.mark = ",")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(nrow(ventanas) + 1, bold = TRUE)
+```
+
+---
+
+## 4. Tipos de cumplimiento: tabla T × D
+
+Antes de cualquier estimación, debemos entender **qué tan fuzzy es el diseño**. La tabla cruzada de T (elegibilidad) y D (tratamiento real) revela la distribución de los cuatro tipos de cumplimiento en la muestra completa.
+
+```{r tabla-TD}
+td_counts <- df %>%
+  count(T, D) %>%
+  group_by(T) %>%
+  mutate(
+    prop_dentro_T = n / sum(n),
+    tipo = case_when(
+      T == 0 & D == 0 ~ "Never-takers (o compliers control)",
+      T == 0 & D == 1 ~ "Always-takers",
+      T == 1 & D == 0 ~ "Never-takers",
+      T == 1 & D == 1 ~ "Compliers (o always-takers)"
+    )
+  )
+
+# Tabla amplia para presentar
+df %>%
+  mutate(
+    T_label = ifelse(T == 1, "Elegible (T = 1)", "No elegible (T = 0)"),
+    D_label = ifelse(D == 1, "Inscrito en élite (D = 1)", "No inscrito (D = 0)")
+  ) %>%
+  count(T_label, D_label) %>%
+  mutate(
+    prop    = paste0(round(n / nrow(df) * 100, 1), "%"),
+    celda   = paste0(format(n, big.mark = ","), "  (", prop, ")")
+  ) %>%
+  select(T_label, D_label, celda) %>%
+  pivot_wider(names_from = D_label, values_from = celda) %>%
+  rename(Elegibilidad = T_label) %>%
+  kable(
+    caption = "Tabla de cumplimiento T × D (frecuencias y % del total)"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  add_header_above(c(" " = 1, "Tratamiento efectivo (D)" = 2))
+```
+
+```{r fuerza-instrumento}
+# Salto en P(D=1) en el umbral — estimación naive de la fuerza del instrumento
+p_D_elegible    <- mean(df$D[df$T == 1], na.rm = TRUE)
+p_D_no_elegible <- mean(df$D[df$T == 0], na.rm = TRUE)
+salto_D         <- p_D_elegible - p_D_no_elegible
+
+cat(sprintf(
+  "P(D=1 | T=1) = %.3f   |   P(D=1 | T=0) = %.3f   |   Salto = %.3f (%.1f pp)\n",
+  p_D_elegible, p_D_no_elegible, salto_D, salto_D * 100
+))
+```
+
+> **Interpretación:** La diferencia P(D=1 | T=1) − P(D=1 | T=0) es la estimación naive del **salto en la primera etapa**. En un diseño *sharp* este salto sería 1.0 (todos los elegibles se inscriben). Un salto menor confirma el carácter *fuzzy* y determina la fuerza del instrumento — valores por debajo de 0.1 sugerirían un instrumento débil.
+
+---
+
+## 5. Primera etapa: toma del tratamiento (D vs. X1)
+
+El binscatter usa los bins IMSE-óptimos de `rdplot()` del paquete `rdrobust` — la visualización canónica en la literatura de RDD (Cattaneo, Idrobo & Titiunik 2024). Mostramos la probabilidad de inscribirse en universidad de élite en función del puntaje relativo al umbral.
+
+```{r primera-etapa-rdplot, fig.cap="Visualización canónica RDD: primera etapa"}
+# Extraemos datos de rdplot para regraficar con nuestro tema
+rp_D <- rdplot(y = df$D, x = df$X1, hide = TRUE, title = "")
+
+bins_D <- rp_D$vars_bins
+poly_D <- rp_D$vars_poly
+
+ggplot() +
+  geom_point(
+    data  = bins_D,
+    aes(x = rdplot_mean_x, y = rdplot_mean_y, color = rdplot_mean_x >= 0),
+    size = 2.2, alpha = 0.85
+  ) +
+  geom_line(
+    data = poly_D,
+    aes(x = rdplot_x, y = rdplot_y,
+        color = rdplot_x >= 0, group = rdplot_x >= 0),
+    linewidth = 0.9
+  ) +
+  geom_vline(xintercept = 0, color = COL_UMBR, linewidth = 0.9, linetype = "dashed") +
+  scale_color_manual(
+    values = c("FALSE" = COL_CTRL, "TRUE" = COL_TRAT),
+    labels = c("FALSE" = "No elegible (T = 0)", "TRUE" = "Elegible (T = 1)")
+  ) +
+  scale_y_continuous(labels = label_percent()) +
+  labs(
+    title    = "Primera etapa: P(D = 1 | X1) — bins IMSE-óptimos (rdplot)",
+    subtitle = "El salto en X1 = 0 es la fuente de variación instrumental del diseño fuzzy",
+    x        = "Puntaje relativo al umbral (X1)",
+    y        = "P(inscrito en universidad de élite | X1)",
+    color    = NULL
+  ) +
+  theme(legend.position = "top")
+```
+
+> **Qué buscamos:** Un salto grande y nítido en X1 = 0 confirma la **relevancia del instrumento** (condición necesaria para 2SLS). La magnitud del salto — el mismo número calculado en la sección anterior — aparece aquí de forma visual.
+
+---
+
+## 6. Forma reducida: resultado vs. variable forzosa (Y vs. X1)
+
+La **forma reducida** es la relación entre superar el umbral (T) y el resultado final Y, sin pasar por D. Una discontinuidad aquí, combinada con el salto en D, es evidencia prima facie de un efecto causal del programa.
+
+```{r forma-reducida-rdplot, fig.cap="Visualización canónica RDD: forma reducida"}
+rp_Y <- rdplot(y = df$Y, x = df$X1, hide = TRUE, title = "")
+
+bins_Y <- rp_Y$vars_bins
+poly_Y <- rp_Y$vars_poly
+
+ggplot() +
+  geom_point(
+    data  = bins_Y,
+    aes(x = rdplot_mean_x, y = rdplot_mean_y, color = rdplot_mean_x >= 0),
+    size = 2.2, alpha = 0.85
+  ) +
+  geom_line(
+    data = poly_Y,
+    aes(x = rdplot_x, y = rdplot_y,
+        color = rdplot_x >= 0, group = rdplot_x >= 0),
+    linewidth = 0.9
+  ) +
+  geom_vline(xintercept = 0, color = COL_UMBR, linewidth = 0.9, linetype = "dashed") +
+  scale_color_manual(
+    values = c("FALSE" = COL_CTRL, "TRUE" = COL_TRAT),
+    labels = c("FALSE" = "No elegible (T = 0)", "TRUE" = "Elegible (T = 1)")
+  ) +
+  scale_y_continuous(labels = label_percent()) +
+  labs(
+    title    = "Forma reducida: P(Y = 1 | X1) — bins IMSE-óptimos (rdplot)",
+    subtitle = "Una discontinuidad en X1 = 0 indicaría un efecto causal de la elegibilidad sobre Y",
+    x        = "Puntaje relativo al umbral (X1)",
+    y        = "P(resultado positivo | X1)",
+    color    = NULL
+  ) +
+  theme(legend.position = "top")
+```
+
+> **Intuición Fuzzy RDD:**
+> $$\widehat{\text{LATE}} = \frac{\text{salto en } \mathbb{E}[Y \mid X_1]}{\text{salto en } \mathbb{E}[D \mid X_1]} \bigg|_{X_1 = 0}$$
+> El numerador es el salto visible en esta gráfica; el denominador es el salto de la sección anterior. El cociente es la estimación no paramétrica del LATE para los *compliers*.
+
+---
+
+## 7. Covariables demográficas
+
+Exploramos la distribución de las covariables **pre-tratamiento** por grupo de elegibilidad. Estas variables son anteriores al examen, por lo que no deberían ser afectadas por el programa — sirven de chequeo de balance.
+
+```{r covariables-continuas, fig.height=7}
+p_edad <- ggplot(df, aes(x = icfes_age, fill = factor(T))) +
+  geom_histogram(bins = 18, color = "white", linewidth = 0.2,
+                 alpha = 0.85, position = "identity") +
+  scale_fill_manual(
+    values = c("0" = COL_CTRL, "1" = COL_TRAT),
+    labels = c("No elegible", "Elegible")
+  ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(title = "Edad al presentar el examen",
+       x = "Edad", y = "Frecuencia", fill = NULL) +
+  theme(legend.position = "top")
+
+p_estrato <- df %>%
+  filter(!is.na(icfes_stratum)) %>%
+  count(icfes_stratum, T) %>%
+  group_by(T) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = factor(icfes_stratum), y = prop, fill = factor(T))) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(
+    values = c("0" = COL_CTRL, "1" = COL_TRAT),
+    labels = c("No elegible", "Elegible")
+  ) +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Estrato socioeconómico",
+       x = "Estrato (1 = más bajo)", y = "Proporción", fill = NULL) +
+  theme(legend.position = "top")
+
+p_famsize <- df %>%
+  filter(!is.na(icfes_famsize)) %>%
+  ggplot(aes(x = icfes_famsize, fill = factor(T))) +
+  geom_histogram(bins = 14, color = "white", linewidth = 0.2,
+                 alpha = 0.85, position = "identity") +
+  scale_fill_manual(
+    values = c("0" = COL_CTRL, "1" = COL_TRAT),
+    labels = c("No elegible", "Elegible")
+  ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(title = "Tamaño del hogar",
+       x = "Personas en el hogar", y = "Frecuencia", fill = NULL) +
+  theme(legend.position = "top")
+
+p_edad / (p_estrato + p_famsize) +
+  plot_annotation(
+    title    = "Covariables continuas y ordinales por grupo de elegibilidad",
+    subtitle = "Los dos grupos deberían ser similares en covariables pre-tratamiento",
+    theme    = theme(
+      plot.title    = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 11)
+    )
+  )
+```
+
+```{r covariables-binarias, fig.height=4}
+p_female <- df %>%
+  count(icfes_female, T) %>%
+  group_by(T) %>%
+  mutate(prop = n / sum(n)) %>%
+  filter(icfes_female == 1) %>%
+  ggplot(aes(x = factor(T), y = prop, fill = factor(T))) +
+  geom_col(width = 0.5, alpha = 0.85) +
+  scale_fill_manual(values = c("0" = COL_CTRL, "1" = COL_TRAT)) +
+  scale_x_discrete(labels = c("No elegible", "Elegible")) +
+  scale_y_continuous(labels = label_percent(), limits = c(0, 1)) +
+  labs(title = "Proporción de mujeres", x = NULL, y = NULL) +
+  theme(legend.position = "none")
+
+p_urm <- df %>%
+  count(icfes_urm, T) %>%
+  group_by(T) %>%
+  mutate(prop = n / sum(n)) %>%
+  filter(icfes_urm == 1) %>%
+  ggplot(aes(x = factor(T), y = prop, fill = factor(T))) +
+  geom_col(width = 0.5, alpha = 0.85) +
+  scale_fill_manual(values = c("0" = COL_CTRL, "1" = COL_TRAT)) +
+  scale_x_discrete(labels = c("No elegible", "Elegible")) +
+  scale_y_continuous(labels = label_percent(), limits = c(0, 1)) +
+  labs(title = "Proporción de minorías (URM)", x = NULL, y = NULL) +
+  theme(legend.position = "none")
+
+(p_female + p_urm) +
+  plot_annotation(
+    title    = "Covariables binarias por grupo de elegibilidad",
+    subtitle = "Barras similares entre grupos indican balance en composición demográfica",
+    theme    = theme(
+      plot.title    = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 11)
+    )
+  )
+```
+
+### Resultado Y por subgrupos demográficos
+
+Antes de estimar efectos heterogéneos, exploramos cómo varía el resultado Y en la muestra completa según género, estatus de minoría y estrato. Esto motiva el análisis CATE de `04_cate.Rmd`.
+
+```{r Y-por-subgrupos}
+# Por género y URM
+df %>%
+  mutate(
+    Género = ifelse(icfes_female == 1, "Mujer", "Hombre"),
+    URM    = ifelse(icfes_urm == 1, "Minoría (URM)", "No minoría")
+  ) %>%
+  group_by(Género, URM) %>%
+  summarise(
+    n          = n(),
+    `Y medio (%)` = round(mean(Y, na.rm = TRUE) * 100, 1),
+    `D medio (%)` = round(mean(D, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  kable(caption = "Resultado Y promedio por género y estatus de minoría") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r Y-por-estrato}
+df %>%
+  filter(!is.na(icfes_stratum)) %>%
+  group_by(Estrato = factor(icfes_stratum)) %>%
+  summarise(
+    n             = n(),
+    `Y medio (%)` = round(mean(Y, na.rm = TRUE) * 100, 1),
+    `D medio (%)` = round(mean(D, na.rm = TRUE) * 100, 1),
+    `T medio (%)` = round(mean(T, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  kable(caption = "Resultado Y promedio por estrato socioeconómico") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+> **Qué buscamos:** Si Y varía mucho entre subgrupos, hay heterogeneidad que vale la pena explorar en el análisis CATE. Si Y es similar en todos los grupos, el efecto promedio puede ser representativo.
+
+---
+
+## 8. Balance de covariables alrededor del umbral
+
+Un supuesto central del diseño RD es que **no hay discontinuidad en las covariables pre-tratamiento** en X1 = 0. Aquí hacemos la exploración visual; la prueba formal (con intervalos de confianza) está en `02_supuestos.Rmd`.
+
+```{r balance-cov, fig.height=10}
+cov_lista <- list(
+  "Edad (icfes_age)"            = "icfes_age",
+  "Mujer (icfes_female)"        = "icfes_female",
+  "Minoría URM (icfes_urm)"     = "icfes_urm",
+  "Estrato (icfes_stratum)"     = "icfes_stratum",
+  "Tam. hogar (icfes_famsize)"  = "icfes_famsize"
+)
+
+plots_balance <- lapply(names(cov_lista), function(label) {
+  var <- cov_lista[[label]]
+
+  df_b <- df %>%
+    filter(!is.na(.data[[var]])) %>%
+    mutate(
+      lado = ifelse(X1 >= 0, "Elegible", "No elegible"),
+      bin  = cut(X1, breaks = 40)
+    ) %>%
+    group_by(bin, lado) %>%
+    summarise(
+      mean_cov = mean(.data[[var]]),
+      mean_X1  = mean(X1),
+      .groups  = "drop"
+    )
+
+  ggplot(df_b, aes(x = mean_X1, y = mean_cov, color = lado)) +
+    geom_point(size = 1.5, alpha = 0.8) +
+    geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = TRUE,
+                alpha = 0.12, linewidth = 0.7) +
+    geom_vline(xintercept = 0, color = COL_UMBR,
+               linewidth = 0.8, linetype = "dashed") +
+    scale_color_manual(
+      values = c("No elegible" = COL_CTRL, "Elegible" = COL_TRAT)
+    ) +
+    labs(title = label, x = "X1", y = NULL, color = NULL) +
+    theme(
+      legend.position = "none",
+      plot.title      = element_text(size = 10, face = "bold")
+    )
+})
+
+wrap_plots(plots_balance, ncol = 2) +
+  plot_annotation(
+    title    = "Balance de covariables alrededor del umbral (X1 = 0)",
+    subtitle = "Sin discontinuidades visibles → supuesto de continuidad preliminarmente soportado",
+    theme    = theme(
+      plot.title    = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 11)
+    )
+  )
+```
+
+> **Lectura esperada:** Si el diseño es válido, las líneas de regresión a ambos lados del umbral deberían coincidir en X1 = 0. Un quiebre abrupto en cualquier covariable sería evidencia de manipulación o contaminación del diseño.
+
+---
+
+## Resumen y próximos pasos
+
+```{r resumen-tabla}
+# Calculamos los hallazgos del dataset real — no texto fijo
+salto_D_val <- mean(df$D[df$T == 1], na.rm = TRUE) - mean(df$D[df$T == 0], na.rm = TRUE)
+salto_Y_val <- mean(df$Y[df$T == 1], na.rm = TRUE) - mean(df$Y[df$T == 0], na.rm = TRUE)
+n_faltantes <- sum(is.na(df$icfes_stratum)) + sum(is.na(df$icfes_famsize))
+n_ventana10 <- sum(abs(df$X1) <= 10)
+
+tibble(
+  Sección = c(
+    "Datos",
+    "Variable forzosa",
+    "Cumplimiento T × D",
+    "Primera etapa",
+    "Forma reducida",
+    "Balance de covariables"
+  ),
+  `Hallazgo` = c(
+    paste0(format(nrow(df), big.mark = ","),
+           " obs. · 9 variables · ",
+           format(n_faltantes, big.mark = ","),
+           " valores faltantes (estrato y tam. hogar)"),
+    paste0("Distribución visualmente continua en X1 = 0 · ",
+           format(n_ventana10, big.mark = ","),
+           " obs. dentro de ±10 puntos del umbral"),
+    paste0("Salto en P(D=1): +",
+           round(salto_D_val * 100, 1),
+           " pp al cruzar el umbral → diseño fuzzy confirmado"),
+    paste0("P(D=1 | T=1) = ",
+           round(mean(df$D[df$T == 1], na.rm = TRUE), 3),
+           " vs P(D=1 | T=0) = ",
+           round(mean(df$D[df$T == 0], na.rm = TRUE), 3),
+           " → instrumento relevante"),
+    paste0("Salto en P(Y=1): +",
+           round(salto_Y_val * 100, 1),
+           " pp al cruzar el umbral → evidencia prima facie de efecto causal"),
+    "Sin saltos visibles en ninguna covariable pre-tratamiento (verificación formal pendiente)"
+  )
+) %>%
+  kable(caption = "Hallazgos del análisis exploratorio — calculados del dataset") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width = TRUE
+  ) %>%
+  column_spec(1, bold = TRUE, width = "20%") %>%
+  column_spec(2, width = "80%")
+```
+
+**Siguientes pasos — `02_supuestos.Rmd`:**
+
+1. Prueba formal de McCrary con `rddensity` — continuidad de la densidad de X1 en el umbral
+2. Tabla de balance con pruebas t por covariable en la vecindad del umbral
+3. Verificación de ausencia de efectos en umbrales **placebo** (X1 = −10, X1 = +10)
+4. Selección del ancho de banda óptimo con `rdbwselect`
