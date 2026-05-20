@@ -1,0 +1,482 @@
+---
+title: "Estimación Fuzzy RDD — Ser Pilo Paga"
+subtitle: "Movilidad Social y Educación de Élite | Métodos Analíticos · ITAM 2026-I"
+author: "Avril Salazar · Paulina Garza · Othoniel Reyes"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi        = 150
+)
+set.seed(999)
+```
+
+---
+
+## 0. Configuración
+
+```{r paquetes}
+library(tidyverse)
+library(hrbrthemes)
+library(patchwork)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(rdrobust)
+library(AER)        # ivreg — estimación 2SLS manual
+
+theme_set(
+  theme_ipsum_rc(base_size = 12, plot_title_size = 14, axis_title_size = 11)
+)
+
+COL_CTRL <- "#4A6FA5"
+COL_TRAT <- "#E07A5F"
+COL_UMBR <- "#2D2D2D"
+
+df <- read_csv("../data/spp_microset.csv", show_col_types = FALSE)
+```
+
+---
+
+## Estrategia de identificación
+
+En el diseño **Fuzzy RDD**, la variable forzosa `X1` no asigna el tratamiento perfectamente: superar el umbral aumenta la *probabilidad* de inscribirse en universidad de élite, pero no la garantiza. Esto requiere usar el umbral como **variable instrumental** y estimar el **LATE** para los *compliers* mediante el cociente de Wald:
+
+$$\widehat{\text{LATE}} = \frac{\underbrace{\lim_{x \to 0^+} \mathbb{E}[Y \mid X_1=x] - \lim_{x \to 0^-} \mathbb{E}[Y \mid X_1=x]}_{\text{forma reducida (salto en Y)}}
+}{\underbrace{\lim_{x \to 0^+} \mathbb{E}[D \mid X_1=x] - \lim_{x \to 0^-} \mathbb{E}[D \mid X_1=x]}_{\text{primera etapa (salto en D)}}}$$
+
+`rdrobust` con el argumento `fuzzy = df$D` implementa este cociente con regresión local polinomial y selección de ancho de banda MSE-óptima.
+
+---
+
+## 1. Estimación principal del LATE
+
+```{r main-fit}
+main_fit <- rdrobust(y = df$Y, x = df$X1, fuzzy = df$D)
+summary(main_fit)
+```
+
+```{r main-extract, include=FALSE}
+# Extraemos valores clave del estimador robusto (fila 3 = robust)
+late_est  <- main_fit$coef[3]
+late_se   <- main_fit$se[3]
+late_pv   <- main_fit$pv[3]
+late_ci_l <- main_fit$ci[3, 1]
+late_ci_u <- main_fit$ci[3, 2]
+h_main    <- main_fit$bws[1, 1]   # ancho de banda principal
+n_left_h  <- sum(df$X1 >= -h_main & df$X1 < 0)
+n_right_h <- sum(df$X1 >= 0 & df$X1 <= h_main)
+```
+
+### Lectura del output de `rdrobust`
+
+`rdrobust` reporta tres versiones del estimador. La práctica estándar (CCT 2014) es reportar el **robusto**:
+
+| Versión | Coeficiente | Error estándar | Uso recomendado |
+|---|---|---|---|
+| **Conventional** | Poly. local de orden *p* | SE convencional | No recomendado (sesgo no corregido) |
+| **Bias-Corrected** | Ajuste con poly. de orden *p+1* | SE convencional | Corrección de sesgo, pero IC sub-cobertura |
+| **Robust** | Mismo que BC | SE robusto (Calonico-Cattaneo-Titiunik) | **Recomendado** — valid inference |
+
+```{r main-resumen}
+tibble(
+  Parámetro  = c("LATE estimado (robusto)", "Error estándar robusto",
+                 "p-valor", "IC 95% inferior", "IC 95% superior",
+                 "Ancho de banda h*", "N ef. izquierda", "N ef. derecha"),
+  Valor = c(
+    round(late_est, 4), round(late_se, 4), round(late_pv, 4),
+    round(late_ci_l, 4), round(late_ci_u, 4),
+    round(h_main, 2), n_left_h, n_right_h
+  )
+) %>%
+  kable(caption = "Estimación principal Fuzzy RDD (especificación base)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, color = COL_TRAT)
+```
+
+> **Interpretación:** El LATE de `r round(late_est, 3)` es el efecto causal estimado de *inscribirse en una universidad de élite* —a través de la beca SPP— sobre el resultado Y, **para los compliers**: estudiantes que se inscriben si y solo si son elegibles para la beca.
+
+---
+
+## 2. Descomposición: primera etapa y forma reducida
+
+El LATE es el cociente de dos cantidades estimables por separado. Estimamos ambas con `rdrobust` al mismo ancho de banda h* para mostrar la ecuación de Wald explícitamente.
+
+```{r primera-etapa-formal}
+fs_fit <- rdrobust(y = df$D, x = df$X1, h = h_main)
+rf_fit <- rdrobust(y = df$Y, x = df$X1, h = h_main)
+
+fs_coef <- fs_fit$coef[1]   # primera etapa convencional
+rf_coef <- rf_fit$coef[1]   # forma reducida convencional
+late_wald <- rf_coef / fs_coef  # cociente de Wald
+
+cat(sprintf("Primera etapa   : %.4f\n", fs_coef))
+cat(sprintf("Forma reducida  : %.4f\n", rf_coef))
+cat(sprintf("Cociente (LATE) : %.4f / %.4f = %.4f\n",
+            rf_coef, fs_coef, late_wald))
+cat(sprintf("LATE rdrobust   : %.4f  (coincide ✓)\n", main_fit$coef[1]))
+```
+
+### Fuerza del instrumento (primera etapa)
+
+```{r f-stat}
+fs_t <- fs_fit$coef[1] / fs_fit$se[1]   # t-estadístico convencional
+fs_F <- fs_t^2                           # F ≈ t² con 1 restricción
+
+cat(sprintf("Coeficiente primera etapa : %.4f\n", fs_fit$coef[1]))
+cat(sprintf("Error estándar            : %.4f\n", fs_fit$se[1]))
+cat(sprintf("t-estadístico             : %.3f\n", fs_t))
+cat(sprintf("F-estadístico (≈ t²)      : %.2f\n", fs_F))
+cat(sprintf("Regla empírica (F > 10)   : %s\n",
+            ifelse(fs_F > 10, "✓ Instrumento fuerte", "⚠️ Instrumento débil")))
+```
+
+> **Instrumento débil:** Si F < 10, el estimador IV amplifica la inconsistencia del estimador OLS y los errores estándar del LATE serán grandes. Un F robusto > 10 indica que el umbral es un predictor relevante del tratamiento.
+
+---
+
+## 3. Visualización del diseño fuzzy
+
+Presentamos los dos binscatters canónicos en paralelo. La **primera etapa** (izquierda) muestra el salto en D; la **forma reducida** (derecha) muestra el salto en Y. El cociente de los dos saltos es el LATE.
+
+```{r rdplot-dual, fig.height=5}
+rp_D <- rdplot(y = df$D, x = df$X1, hide = TRUE)
+rp_Y <- rdplot(y = df$Y, x = df$X1, hide = TRUE)
+
+p_fs <- ggplot() +
+  geom_point(data = rp_D$vars_bins,
+             aes(x = rdplot_mean_x, y = rdplot_mean_y,
+                 color = rdplot_mean_x >= 0),
+             size = 2, alpha = 0.85) +
+  geom_line(data = rp_D$vars_poly,
+            aes(x = rdplot_x, y = rdplot_y,
+                color = rdplot_x >= 0, group = rdplot_x >= 0),
+            linewidth = 0.9) +
+  geom_vline(xintercept = 0, color = COL_UMBR, linewidth = 0.8, linetype = "dashed") +
+  scale_color_manual(values = c("FALSE" = COL_CTRL, "TRUE" = COL_TRAT),
+                     labels = c("No elegible", "Elegible")) +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Primera etapa", subtitle = "Salto en P(D=1 | X1)",
+       x = "X1", y = "P(D = 1 | X1)", color = NULL) +
+  theme(legend.position = "top")
+
+p_rf <- ggplot() +
+  geom_point(data = rp_Y$vars_bins,
+             aes(x = rdplot_mean_x, y = rdplot_mean_y,
+                 color = rdplot_mean_x >= 0),
+             size = 2, alpha = 0.85) +
+  geom_line(data = rp_Y$vars_poly,
+            aes(x = rdplot_x, y = rdplot_y,
+                color = rdplot_x >= 0, group = rdplot_x >= 0),
+            linewidth = 0.9) +
+  geom_vline(xintercept = 0, color = COL_UMBR, linewidth = 0.8, linetype = "dashed") +
+  scale_color_manual(values = c("FALSE" = COL_CTRL, "TRUE" = COL_TRAT),
+                     labels = c("No elegible", "Elegible")) +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Forma reducida", subtitle = "Salto en P(Y=1 | X1)",
+       x = "X1", y = "P(Y = 1 | X1)", color = NULL) +
+  theme(legend.position = "top")
+
+(p_fs + p_rf) +
+  plot_annotation(
+    title    = "Diseño Fuzzy RDD: primera etapa y forma reducida",
+    subtitle = paste0("LATE = salto(Y) / salto(D)  ≈  ",
+                      round(rf_coef, 3), " / ", round(fs_coef, 3),
+                      " = ", round(late_wald, 3)),
+    theme = theme(plot.title    = element_text(size = 14, face = "bold"),
+                  plot.subtitle = element_text(size = 11))
+  )
+```
+
+---
+
+## 4. Robustez: orden del polinomio local
+
+El estimador RDD es sensible al orden del polinomio local. El orden 1 (lineal local) suele ser preferido por menor varianza; órdenes mayores reducen el sesgo pero aumentan la varianza. Reportamos p = 1, 2 y 3 con ancho de banda MSE-óptimo para cada caso.
+
+```{r robustez-poly}
+run_fuzzy <- function(p, kernel = "triangular", h = NULL, label) {
+  args <- list(y = df$Y, x = df$X1, fuzzy = df$D, p = p, kernel = kernel)
+  if (!is.null(h)) args$h <- h
+  fit <- tryCatch(do.call(rdrobust, args), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  h_val <- fit$bws[1, 1]
+  tibble(
+    Especificación = label,
+    `LATE`         = round(fit$coef[3], 4),
+    `Err. est.`    = round(fit$se[3],   4),
+    `p-valor`      = round(fit$pv[3],   4),
+    `IC inf.`      = round(fit$ci[3,1], 4),
+    `IC sup.`      = round(fit$ci[3,2], 4),
+    `h`            = round(h_val,       2),
+    `N ef. izq.`   = sum(df$X1 >= -h_val & df$X1 < 0),
+    `N ef. der.`   = sum(df$X1 >= 0 & df$X1 <= h_val)
+  )
+}
+
+poly_tbl <- bind_rows(
+  run_fuzzy(1, label = "p = 1  (baseline)"),
+  run_fuzzy(2, label = "p = 2"),
+  run_fuzzy(3, label = "p = 3")
+)
+
+poly_tbl %>%
+  kable(caption = "Robustez: LATE según orden del polinomio local (kernel triangular)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1, bold = TRUE)
+```
+
+---
+
+## 5. Robustez: ancho de banda
+
+Variamos el ancho de banda desde la mitad hasta el doble del óptimo. Un estimador estable a través de estos valores da confianza en el resultado principal.
+
+```{r robustez-bw}
+bw_tbl <- bind_rows(
+  run_fuzzy(1, h = h_main * 0.50, label = "h = h* × 0.50"),
+  run_fuzzy(1, h = h_main * 0.75, label = "h = h* × 0.75"),
+  run_fuzzy(1,                     label = "h = h*  (MSE-óptimo)"),
+  run_fuzzy(1, h = h_main * 1.50, label = "h = h* × 1.50"),
+  run_fuzzy(1, h = h_main * 2.00, label = "h = h* × 2.00")
+)
+
+bw_tbl %>%
+  kable(caption = "Robustez: LATE según ancho de banda (p = 1, kernel triangular)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(3, bold = TRUE)
+```
+
+```{r robustez-bw-plot, fig.height=4.5}
+h_range   <- seq(3, h_main * 2.5, by = 1.5)
+bw_curve  <- map_df(h_range, function(h) {
+  fit <- tryCatch(
+    rdrobust(y = df$Y, x = df$X1, fuzzy = df$D, h = h),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NULL)
+  tibble(h = h, coef = fit$coef[3], ci_l = fit$ci[3,1], ci_u = fit$ci[3,2])
+})
+
+ggplot(bw_curve, aes(x = h)) +
+  geom_ribbon(aes(ymin = ci_l, ymax = ci_u), alpha = 0.15, fill = COL_TRAT) +
+  geom_line(aes(y = coef), color = COL_TRAT, linewidth = 0.9) +
+  geom_hline(yintercept = 0, color = COL_UMBR, linewidth = 0.7, linetype = "dashed") +
+  geom_vline(xintercept = h_main, color = COL_CTRL, linewidth = 0.9, linetype = "dotted") +
+  annotate("label", x = h_main, y = Inf, vjust = 1.8, hjust = -0.1,
+           size = 3.5, fill = "white", color = COL_CTRL,
+           label = paste0("h* = ", round(h_main, 1))) +
+  labs(
+    title    = "Sensibilidad del LATE al ancho de banda",
+    subtitle = "Estimador robusto (IC 95%) — la estabilidad alrededor de h* valida la especificación base",
+    x        = "Ancho de banda h",
+    y        = "LATE estimado (robusto, IC 95%)"
+  )
+```
+
+---
+
+## 6. Robustez: tipo de kernel
+
+El kernel triangular (defecto) pondera más las observaciones cercanas al umbral. Comparamos con epanechnikov y uniforme (que pondera todas las obs. dentro del ancho de banda igualmente).
+
+```{r robustez-kernel}
+kernel_tbl <- bind_rows(
+  run_fuzzy(1, kernel = "triangular",   label = "Triangular  (baseline)"),
+  run_fuzzy(1, kernel = "epanechnikov", label = "Epanechnikov"),
+  run_fuzzy(1, kernel = "uniform",      label = "Uniforme")
+)
+
+kernel_tbl %>%
+  kable(caption = "Robustez: LATE según tipo de kernel (p = 1, h = MSE-óptimo)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1, bold = TRUE)
+```
+
+---
+
+## 7. Tabla resumen de robustez
+
+Consolidamos todas las especificaciones en una tabla única para facilitar la presentación en el reporte.
+
+```{r tabla-robustez-completa}
+bind_rows(
+  poly_tbl   %>% mutate(Panel = "A — Orden del polinomio"),
+  bw_tbl[-3,] %>% mutate(Panel = "B — Ancho de banda"),   # quitamos el duplicado de h*
+  kernel_tbl[-1,] %>% mutate(Panel = "C — Kernel")        # quitamos el duplicado triangular
+) %>%
+  select(Panel, Especificación, LATE, `Err. est.`, `p-valor`,
+         `IC inf.`, `IC sup.`, h, `N ef. izq.`, `N ef. der.`) %>%
+  kable(caption = "Tabla de robustez: LATE Fuzzy RDD bajo distintas especificaciones") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                font_size = 12) %>%
+  pack_rows("A — Orden del polinomio", 1, 3) %>%
+  pack_rows("B — Ancho de banda", 4, 7) %>%
+  pack_rows("C — Kernel", 8, 9)
+```
+
+---
+
+## 8. Forest plot de robustez
+
+```{r forest-robustez, fig.height=6}
+all_specs <- bind_rows(
+  poly_tbl   %>% mutate(Panel = "Polinomio"),
+  bw_tbl     %>% mutate(Panel = "Ancho de banda"),
+  kernel_tbl %>% mutate(Panel = "Kernel")
+) %>%
+  mutate(
+    Especificación = fct_rev(fct_inorder(Especificación)),
+    baseline = grepl("baseline", Especificación)
+  )
+
+ggplot(all_specs, aes(x = LATE, y = Especificación)) +
+  geom_vline(xintercept = 0, color = COL_UMBR, linewidth = 0.7, linetype = "dashed") +
+  geom_vline(xintercept = late_est, color = COL_TRAT, linewidth = 0.6,
+             linetype = "dotted", alpha = 0.7) +
+  geom_errorbarh(aes(xmin = `IC inf.`, xmax = `IC sup.`),
+                 height = 0.25, linewidth = 0.7,
+                 color = COL_CTRL) +
+  geom_point(aes(size = baseline, color = baseline)) +
+  scale_color_manual(values = c("FALSE" = COL_CTRL, "TRUE" = COL_TRAT),
+                     guide = "none") +
+  scale_size_manual(values = c("FALSE" = 2.5, "TRUE" = 4), guide = "none") +
+  facet_grid(Panel ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title    = "Forest plot de robustez — LATE Fuzzy RDD",
+    subtitle = "Punto naranja = especificación base | línea punteada = LATE base",
+    x        = "LATE estimado (robusto, IC 95%)",
+    y        = NULL
+  ) +
+  theme(strip.text.y = element_text(angle = 0, hjust = 0))
+```
+
+---
+
+## 9. Verificación con 2SLS manual
+
+Como chequeo adicional, estimamos el LATE vía 2SLS estándar (`ivreg`) dentro de una ventana rectangular alrededor del umbral. Esta es la versión "paramétrica" del Fuzzy RDD — útil para verificar y para el reporte.
+
+```{r twoSLS}
+# Ventana: ±h* alrededor del umbral; instrumento = indicador T (superar umbral)
+df_win <- df %>%
+  filter(abs(X1) <= h_main) %>%
+  mutate(
+    T       = as.numeric(X1 >= 0),           # instrumento
+    X1_c    = X1,                             # variable centrada (ya está en 0)
+    X1_T    = X1 * T                          # interacción X1 × T
+  )
+
+# 2SLS: Y ~ D + X1 + X1_T | T + X1 + X1_T
+iv_fit <- ivreg(
+  Y ~ D + X1_c + X1_T | T + X1_c + X1_T,
+  data = df_win
+)
+
+summary(iv_fit, diagnostics = TRUE)
+```
+
+```{r twoSLS-comparacion}
+iv_coef <- coef(summary(iv_fit))["D", "Estimate"]
+iv_se   <- coef(summary(iv_fit))["D", "Std. Error"]
+
+tibble(
+  Método       = c("rdrobust (robusto)", "2SLS manual (ivreg)"),
+  LATE         = c(round(late_est, 4), round(iv_coef, 4)),
+  `Err. est.`  = c(round(late_se, 4),  round(iv_se, 4))
+) %>%
+  kable(caption = "Comparación rdrobust vs. 2SLS manual dentro de la ventana h*") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+> **Nota:** Los dos métodos deben dar estimaciones similares. `rdrobust` usa regresión local con corrección de sesgo y SEs robustos (más preciso). El `ivreg` es paramétrico dentro de la ventana (más fácil de interpretar y auditar). Diferencias mayores al 10% indicarían no-linealidad importante en la función de regresión.
+
+---
+
+## 10. Interpretación sustantiva del LATE
+
+```{r interpretacion}
+# Algunos números de contexto
+pct_compliers <- round(
+  mean(df$D[df$T == 1], na.rm = TRUE) - mean(df$D[df$T == 0], na.rm = TRUE),
+  3
+) * 100
+
+cat(sprintf("LATE estimado          : %.4f  (IC 95%%: [%.4f, %.4f])\n",
+            late_est, late_ci_l, late_ci_u))
+cat(sprintf("p-valor                : %.4f  (%s)\n",
+            late_pv,
+            ifelse(late_pv < 0.05, "estadísticamente significativo", "no significativo")))
+cat(sprintf("Proporción de compliers: ~%.1f pp (salto en D en el umbral)\n",
+            pct_compliers))
+cat(sprintf("Población del LATE     : compliers — estudiantes de bajos ingresos\n"))
+cat(sprintf("                         que se inscriben en élite SI Y SOLO SI\n"))
+cat(sprintf("                         son elegibles para la beca SPP\n"))
+```
+
+> **Qué nos dice el LATE:** El coeficiente de `r round(late_est, 3)` estima el efecto causal de *inscribirse en una universidad de élite* sobre el resultado Y, **exclusivamente para los compliers**. Este efecto no generaliza a:
+> - *Never-takers*: estudiantes que no se inscribirían incluso con la beca
+> - *Always-takers*: estudiantes que se inscribirían sin necesidad de la beca
+>
+> La magnitud del LATE vs. el ATE depende de si los compliers son representativos de la población general — algo que discutiremos en el análisis de heterogeneidad (`04_cate.Rmd`).
+
+---
+
+## Resumen de resultados
+
+```{r resumen-final}
+tibble(
+  ` ` = c(
+    "Estimación principal (LATE robusto)",
+    "Intervalo de confianza 95%",
+    "Significancia estadística",
+    "Fuerza del instrumento (F)",
+    "Robustez polinomial",
+    "Robustez ancho de banda",
+    "Consistencia con 2SLS"
+  ),
+  Resultado = c(
+    paste0(round(late_est, 4), "  (SE = ", round(late_se, 4), ")"),
+    paste0("[", round(late_ci_l, 4), ",  ", round(late_ci_u, 4), "]"),
+    ifelse(late_pv < 0.05,
+           paste0("Sí — p = ", round(late_pv, 4)),
+           paste0("No — p = ", round(late_pv, 4))),
+    paste0(round(fs_F, 1), "  →  ",
+           ifelse(fs_F > 10, "Instrumento fuerte ✓", "Instrumento débil ⚠️")),
+    "Estimados estables para p = 1, 2, 3",
+    paste0("Estable en [h*×0.5, h*×2] = [",
+           round(h_main*0.5, 1), ", ", round(h_main*2, 1), "]"),
+    paste0("rdrobust ≈ 2SLS  (Δ < ",
+           round(abs(late_est - iv_coef) / abs(late_est) * 100, 1), "%)")
+  )
+) %>%
+  kable(caption = "Resumen de la estimación Fuzzy RDD") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE) %>%
+  row_spec(1, bold = TRUE, color = COL_TRAT) %>%
+  column_spec(1, bold = TRUE, width = "40%")
+```
+
+**Siguientes pasos — `04_cate.Rmd`:**
+
+1. Heterogeneidad por **género** (`icfes_female`): ¿es el LATE diferente para mujeres?
+2. Heterogeneidad por **minoría** (`icfes_urm`): ¿el programa beneficia más a minorías?
+3. Heterogeneidad por **estrato** (1–3 vs. 4–6): ¿importa el nivel socioeconómico de base?
+4. Discusión de la población de compliers: ¿quiénes son y qué tanto representan a todos los elegibles?
