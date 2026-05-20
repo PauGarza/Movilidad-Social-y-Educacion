@@ -124,7 +124,8 @@ Antes de comenzar, el equipo debe tener dominio de los siguientes conceptos del 
 Proyecto Final/
 ├── README.md               # este archivo
 ├── data/
-│   └── spp_microset.csv    # datos (NO subir a repositorio público)
+│   └── spp_microset.csv    # Fuente: https://github.com/rdpackages-replication/CIT_2024_CUP
+│                           # Archivo original: CIT_2024_CUP_fuzzy.csv                     
 ├── R/
 │   ├── 01_exploratorio.R
 │   ├── 02_supuestos.R
